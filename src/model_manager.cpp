@@ -10,6 +10,7 @@
 #include <unordered_set>
 
 #include "core/ggml_extend_backend.h"
+#include "core/tensor_split.h"
 #include "core/util.h"
 #include "model/adapter/lora.hpp"
 
@@ -891,8 +892,33 @@ bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
             max_size = MAX_RESIDENCY_BLOCK_BYTES;
         }
 
+        // A tensor-split (meta) buffer type places each tensor's slices on every card itself: give it the tensors,
+        // not a size. Sizes here are whole tensors, so the plain path would reserve the full model on every card.
+        const bool tensor_split = sd_buft_is_tensor_split(params_buft);
+
         auto alloc_chunk = [&](const std::vector<TensorState*>& chunk, size_t chunk_size) -> bool {
             if (chunk.empty() || chunk_size == 0) {
+                return true;
+            }
+
+            if (tensor_split) {
+                std::vector<ggml_tensor*> tensors;
+                tensors.reserve(chunk.size());
+                for (TensorState* state : chunk) {
+                    tensors.push_back(state->tensor);
+                }
+                ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer_n(params_buft, tensors.data(), (int)tensors.size());
+                if (buffer == nullptr) {
+                    LOG_ERROR("model manager alloc tensor-split params buffer failed (%zu tensors)", tensors.size());
+                    return false;
+                }
+                ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                auto block              = std::make_unique<ParamsStorageBlock>();
+                block->buffer           = buffer;
+                block->states           = chunk;
+                ParamsStorageBlock* raw = block.get();
+                params_storage_blocks_.push_back(std::move(block));
+                created_storage_blocks.push_back(raw);
                 return true;
             }
 

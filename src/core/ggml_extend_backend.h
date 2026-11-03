@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "stable-diffusion.h"
+#include "core/tensor_split.h"
 
 enum class SDBackendModule {
     DIFFUSION,
@@ -43,6 +44,7 @@ using SDBackendHandle = std::unique_ptr<struct ggml_backend, SDBackendHandleDele
 enum class SDSplitMode {
     LAYER,
     ROW,
+    TENSOR,  // ggml meta device: every split weight shared by all the module's GPUs (core/tensor_split.h)
 };
 
 class SDBackendManager {
@@ -50,7 +52,11 @@ private:
     SDBackendAssignment runtime_assignment_;
     SDBackendAssignment params_assignment_;
     SDBackendAssignment split_mode_assignment_;
+    // --split-mode <module>=tensor: the split callbacks' data, one per meta backend. Declared before backends_ so it
+    // is destroyed after them (a meta backend reads it).
+    std::unordered_map<std::string, std::unique_ptr<SDTensorSplitContext>> tensor_split_contexts_;
     std::unordered_map<std::string, SDBackendHandle> backends_;
+    ggml_backend_t tensor_split_backend(SDBackendModule module);
 
 public:
     SDBackendManager() = default;

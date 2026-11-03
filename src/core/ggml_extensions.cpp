@@ -1,4 +1,5 @@
 #include "core/ggml_extensions.h"
+#include "core/tensor_split.h"
 
 #ifndef SD_USE_UPSTREAM_GGML
 #include "core/cpu/registration.h"
@@ -410,7 +411,12 @@ void sd_ggml_register_extensions(ggml_backend_t backend) {
     if (!backend) {
         return;
     }
-    auto device    = ggml_backend_get_device(backend);
+    auto device = ggml_backend_get_device(backend);
+    // A tensor-split (meta) device runs extension ops on its cards, whose own backends registered them: nothing
+    // to register for the meta device itself.
+    if (sd_buft_is_tensor_split(ggml_backend_dev_buffer_type(device))) {
+        return;
+    }
     auto reg       = ggml_backend_dev_backend_reg(device);
     const bool cpu = ggml_backend_reg_get_proc_address(reg, "ggml_ext_cpu_parallel_v1") != nullptr;
     static std::mutex mutex;

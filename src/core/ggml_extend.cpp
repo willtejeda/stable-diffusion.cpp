@@ -7,6 +7,7 @@
 
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_runner.h"
+#include "core/tensor_split.h"
 
 ggml_tensor* ggml_ext_mul_n_mode(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b, int mode) {
     // reshape A
@@ -162,7 +163,7 @@ ggml_tensor* ggml_ext_modulate(GGMLRunnerContext* ctx,
                                ggml_tensor* scale) {
 #ifndef SD_USE_UPSTREAM_GGML
     if (x->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && (!shift || shift->type == GGML_TYPE_F32) &&
-        (sd_backend_is_cpu(ctx->backend) || sd_backend_is(ctx->backend, "CUDA") ||
+        (sd_backend_is_cpu(ctx->backend) || sd_backend_is(ctx->backend, "CUDA") || sd_backend_is_tensor_split(ctx->backend) ||
          sd_backend_is(ctx->backend, "ROCm") || sd_backend_is(ctx->backend, "MUSA") || sd_backend_is(ctx->backend, "Vulkan"))) {
         ggml_tensor* inputs[] = {x, scale, shift};
         return ggml_ext_op_create(ctx->ggml_ctx, sd_ggml_modulate_op(), inputs, shift ? 3 : 2, nullptr);
@@ -751,7 +752,7 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     };
 
 #ifndef SD_USE_UPSTREAM_GGML
-    if (sage_attn && mask == nullptr && d_head > 0 && d_head <= 128) {
+    if (sage_attn && mask == nullptr && d_head > 0 && d_head <= 128 && !sd_backend_is_tensor_split(backend)) {
         auto q_in                 = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx, q, GGML_TYPE_F32)), d_head, L_q, n_head, N);
         auto k_in                 = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx, k, GGML_TYPE_F32)), d_head, L_k, n_kv_head, N);
         auto v_in                 = ggml_ext_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));

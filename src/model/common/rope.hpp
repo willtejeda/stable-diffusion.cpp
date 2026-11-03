@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 #include "core/ggml_extend.h"
+#include "core/tensor_split.h"
 #include "core/ggml_runner.h"
 #include "core/util.h"
 

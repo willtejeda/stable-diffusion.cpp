@@ -1,5 +1,6 @@
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_extensions.h"
+#include "core/tensor_split.h"
 
 #include <algorithm>
 #include <cctype>
@@ -902,6 +903,7 @@ SDBackendManager::~SDBackendManager() {
 
 void SDBackendManager::reset() {
     backends_.clear();
+    tensor_split_contexts_.clear();  // after the meta backends that read them
     runtime_assignment_    = {};
     params_assignment_     = {};
     split_mode_assignment_ = {};
@@ -924,10 +926,60 @@ static std::string primary_device_name(const std::string& value) {
 }
 
 ggml_backend_t SDBackendManager::runtime_backend(SDBackendModule module) {
+    if (ggml_backend_t split = tensor_split_backend(module)) {
+        return split;
+    }
     return init_cached_backend(primary_device_name(runtime_assignment_.get(module)));
 }
 
+// The module's meta backend when its split mode is tensor and it names two or more GPUs ("diffusion=cuda0&cuda1"),
+// else nullptr. Weights placed on it are split by core/tensor_split.cpp's rules; its device list is cached.
+ggml_backend_t SDBackendManager::tensor_split_backend(SDBackendModule module) {
+    if (split_mode(module) != SDSplitMode::TENSOR) {
+        return nullptr;
+    }
+    const std::vector<std::string> names = split_device_list(runtime_assignment_.get(module));
+    if (names.size() < 2) {
+        return nullptr;
+    }
+    std::string key = "meta:";
+    std::vector<ggml_backend_dev_t> devices;
+    for (const std::string& name : names) {
+        ggml_backend_t backend = init_cached_backend(name);
+        if (backend == nullptr || sd_backend_is_cpu(backend)) {
+            LOG_ERROR("tensor split: '%s' is not a GPU backend", name.c_str());
+            return nullptr;
+        }
+        ggml_backend_dev_t device = ggml_backend_get_device(backend);
+        if (std::find(devices.begin(), devices.end(), device) != devices.end()) {
+            continue;
+        }
+        devices.push_back(device);
+        key += lower_copy(ggml_backend_dev_name(device)) + ",";
+    }
+    if (devices.size() < 2) {
+        return nullptr;
+    }
+    auto it = backends_.find(key);
+    if (it != backends_.end()) {
+        return it->second.get();
+    }
+    auto ctx               = std::make_unique<SDTensorSplitContext>();
+    ggml_backend_t backend = sd_tensor_split_backend_init(devices, ctx.get());
+    if (backend == nullptr) {
+        LOG_ERROR("tensor split: could not create a meta device over %s", key.c_str());
+        return nullptr;
+    }
+    LOG_INFO("%s module: tensor split over %zu GPUs (%s)", sd_backend_module_name(module), devices.size(), key.c_str() + 5);
+    tensor_split_contexts_.emplace(key, std::move(ctx));
+    backends_.emplace(key, SDBackendHandle(backend));
+    return backend;
+}
+
 std::vector<ggml_backend_t> SDBackendManager::runtime_backends(SDBackendModule module) {
+    if (ggml_backend_t split = tensor_split_backend(module)) {
+        return {split};
+    }
     std::vector<ggml_backend_t> backends;
     for (const std::string& name : split_device_list(runtime_assignment_.get(module))) {
         ggml_backend_t backend = init_cached_backend(name);
@@ -1014,8 +1066,14 @@ bool SDBackendManager::init(const char* backend_spec,
 }
 
 SDSplitMode SDBackendManager::split_mode(SDBackendModule module) const {
-    return lower_copy(trim_copy(split_mode_assignment_.get(module))) == "row" ? SDSplitMode::ROW
-                                                                              : SDSplitMode::LAYER;
+    const std::string mode = lower_copy(trim_copy(split_mode_assignment_.get(module)));
+    if (mode == "row") {
+        return SDSplitMode::ROW;
+    }
+    if (mode == "tensor") {
+        return SDSplitMode::TENSOR;
+    }
+    return SDSplitMode::LAYER;
 }
 
 ggml_backend_buffer_type_t SDBackendManager::split_buffer_type(ggml_backend_t backend,
@@ -1108,11 +1166,11 @@ bool SDBackendManager::validate(std::string* error) const {
     };
     auto validate_split_mode_name = [&](const std::string& name) -> bool {
         const std::string lower = lower_copy(trim_copy(name));
-        if (lower.empty() || lower == "layer" || lower == "row") {
+        if (lower.empty() || lower == "layer" || lower == "row" || lower == "tensor") {
             return true;
         }
         if (error != nullptr) {
-            *error = "invalid split mode '" + name + "' (expected layer or row)";
+            *error = "invalid split mode '" + name + "' (expected layer, row or tensor)";
         }
         return false;
     };
