@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 #include "core/ggml_extend_backend.h"
+#include "core/tensor_split.h"
 #include "core/ggml_tensor_utils.h"
 #include "core/pe_cache.h"
 
@@ -659,6 +660,9 @@ namespace LTXV {
         int64_t heads;
         int64_t dim_head;
         bool rope_interleaved;
+        // Under --split-mode diffusion=tensor: each card keeps its share of the heads after Q/K norm and RoPE. Set for
+        // the video blocks' attn1/attn2, whose V, gates and out-projection core/tensor_split.cpp splits.
+        bool tensor_split_heads = false;
 
         CrossAttention(int64_t query_dim,
                        int64_t context_dim,
@@ -709,6 +713,11 @@ namespace LTXV {
                 }
                 q = apply_hidden_rope(ctx, q, pe, heads, dim_head, rope_interleaved);
                 k = apply_hidden_rope(ctx, k, k_pe, heads, dim_head, rope_interleaved);
+            }
+            if (tensor_split_heads && sd_backend_is_tensor_split(ctx->backend)) {
+                GGML_ASSERT(q->ne[0] == heads * dim_head && k->ne[0] == heads * dim_head);
+                q = sd_tensor_split_select_features(ctx->ggml_ctx, ctx->backend, q);
+                k = sd_tensor_split_select_features(ctx->ggml_ctx, ctx->backend, k);
             }
 
             auto out = ggml_ext_attention_ext(ctx,
@@ -766,8 +775,12 @@ namespace LTXV {
               cross_attention_adaln(cross_attention_adaln),
               self_attention_gated(self_attention_gated),
               cross_attention_gated(cross_attention_gated) {
-            blocks["attn1"] = std::make_shared<CrossAttention>(dim, dim, n_heads, d_head, self_attention_gated, rope_interleaved);
-            blocks["attn2"] = std::make_shared<CrossAttention>(dim, context_dim, n_heads, d_head, cross_attention_gated, false);
+            auto attn1                = std::make_shared<CrossAttention>(dim, dim, n_heads, d_head, self_attention_gated, rope_interleaved);
+            auto attn2                = std::make_shared<CrossAttention>(dim, context_dim, n_heads, d_head, cross_attention_gated, false);
+            attn1->tensor_split_heads = true;
+            attn2->tensor_split_heads = true;
+            blocks["attn1"]           = attn1;
+            blocks["attn2"]           = attn2;
             blocks["ff"]    = std::make_shared<FeedForward>(dim, dim, 4, FeedForward::Activation::GELU);
         }
 
@@ -1156,9 +1169,13 @@ namespace LTXV {
             : v_dim(v_dim),
               a_dim(a_dim),
               cross_attention_adaln(cross_attention_adaln) {
-            blocks["attn1"]               = std::make_shared<CrossAttention>(v_dim, v_dim, v_heads, vd_head, apply_gated_attention, video_rope_interleaved);
+            auto attn1                    = std::make_shared<CrossAttention>(v_dim, v_dim, v_heads, vd_head, apply_gated_attention, video_rope_interleaved);
+            attn1->tensor_split_heads     = true;  // video self-attention: split by heads under tensor split
+            blocks["attn1"]               = attn1;
             blocks["audio_attn1"]         = std::make_shared<CrossAttention>(a_dim, a_dim, a_heads, ad_head, apply_gated_attention, false);
-            blocks["attn2"]               = std::make_shared<CrossAttention>(v_dim, v_context_dim, v_heads, vd_head, apply_gated_attention, false);
+            auto attn2                    = std::make_shared<CrossAttention>(v_dim, v_context_dim, v_heads, vd_head, apply_gated_attention, false);
+            attn2->tensor_split_heads     = true;  // video cross-attention to the prompt
+            blocks["attn2"]               = attn2;
             blocks["audio_attn2"]         = std::make_shared<CrossAttention>(a_dim, a_context_dim, a_heads, ad_head, apply_gated_attention, false);
             blocks["audio_to_video_attn"] = std::make_shared<CrossAttention>(v_dim, a_dim, a_heads, ad_head, apply_gated_attention, false);
             blocks["video_to_audio_attn"] = std::make_shared<CrossAttention>(a_dim, v_dim, a_heads, ad_head, apply_gated_attention, false);

@@ -4,6 +4,7 @@
 #include <mutex>
 #include <regex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "core/util.h"
@@ -22,9 +23,19 @@ namespace {
     const std::vector<SplitRule>& split_rules() {
         // Stage A (Video/tensor-parallel-plan.md): the video blocks' feed-forward only. LTX-2.x: GELU FFN without
         // biases, ff.net.0.proj [dim -> 4 dim], ff.net.2 [4 dim -> dim]; the audio branch (audio_ff) stays mirrored.
+        // Stage B: the video blocks' attention by heads. Q and K are projected, normed and rotated whole on every
+        // card (full-width Q/K RMSNorm and per-head RoPE stay fused), then each card keeps its heads
+        // (sd_tensor_split_select_features); V, the per-head gates and the out-projection are split.
         static const std::vector<SplitRule> rules = {
             {std::regex(R"((^|\.)transformer_blocks\.\d+\.ff\.net\.0\.proj\.weight$)"), 1},
             {std::regex(R"((^|\.)transformer_blocks\.\d+\.ff\.net\.2\.weight$)"), 0},
+            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_v\.weight$)"), 1},
+            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_v\.bias$)"), 0},
+            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_gate_logits\.weight$)"), 1},
+            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_gate_logits\.bias$)"), 0},
+            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_out\.0\.weight$)"), 0},
+            // the feature index tables of sd_tensor_split_select_features: split like the outputs above
+            {std::regex(R"(^sd_tensor_split\.features\.\d+$)"), 0},
         };
         return rules;
     }
@@ -144,4 +155,67 @@ bool sd_buft_is_tensor_split(ggml_backend_buffer_type_t buft) {
     }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     return reg != nullptr && std::string(ggml_backend_reg_name(reg)) == "Meta";
+}
+
+namespace {
+    struct FeatureIndexCache {
+        std::mutex mutex;
+        std::unordered_map<ggml_backend_t, std::unordered_map<int64_t, ggml_tensor*>> tables;
+        std::vector<ggml_context*> contexts;  // kept for the life of the process, like the tables
+    };
+
+    FeatureIndexCache& feature_index_cache() {
+        static FeatureIndexCache cache;
+        return cache;
+    }
+}  // namespace
+
+ggml_tensor* sd_tensor_split_feature_index(ggml_backend_t backend, int64_t n) {
+    if (!sd_backend_is_tensor_split(backend) || n <= 0) {
+        return nullptr;
+    }
+    auto& cache = feature_index_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto& tables = cache.tables[backend];
+    auto it      = tables.find(n);
+    if (it != tables.end()) {
+        return it->second;
+    }
+    ggml_init_params params = {ggml_tensor_overhead() * 2, nullptr, true};
+    ggml_context* ctx       = ggml_init(params);
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor* table = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+    ggml_set_name(table, ("sd_tensor_split.features." + std::to_string(n)).c_str());
+    // A weights-like buffer: the split callback places each card's half of the indices on that card.
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
+    if (buffer == nullptr) {
+        ggml_free(ctx);
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<int32_t> values(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; i++) {
+        values[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    }
+    ggml_backend_tensor_set(table, values.data(), 0, values.size() * sizeof(int32_t));
+    cache.contexts.push_back(ctx);
+    tables[n] = table;
+    return table;
+}
+
+ggml_tensor* sd_tensor_split_select_features(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* x) {
+    ggml_tensor* index = sd_tensor_split_feature_index(backend, x->ne[0]);
+    if (index == nullptr) {
+        return x;
+    }
+    // x: [features, tokens, batch], whole on every card. Transposed, a feature is a row: each card gathers the rows
+    // its index half names, and the transpose back is split along the features like a column-split projection.
+    const int64_t features = x->ne[0];
+    const int64_t rows     = x->ne[1] * x->ne[2] * x->ne[3];
+    ggml_tensor* t         = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, ggml_cont(ctx, x), features, rows)));
+    ggml_tensor* picked    = ggml_get_rows(ctx, t, index);  // [rows, features], split along the features
+    ggml_tensor* back      = ggml_cont(ctx, ggml_transpose(ctx, picked));
+    return ggml_reshape_4d(ctx, back, features, x->ne[1], x->ne[2], x->ne[3]);
 }

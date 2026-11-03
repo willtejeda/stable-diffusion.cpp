@@ -29,4 +29,12 @@ bool sd_backend_is_tensor_split(ggml_backend_t backend);
 // True for a buffer type of a meta device (a tensor-split backend's weights or compute buffers).
 bool sd_buft_is_tensor_split(ggml_backend_buffer_type_t buft);
 
+// A static I32 table 0..n-1 on a tensor-split backend, split across its cards like a column-split projection's
+// outputs; cached per backend and n. nullptr for any other backend.
+ggml_tensor* sd_tensor_split_feature_index(ggml_backend_t backend, int64_t n);
+
+// On a tensor-split backend: x ([features, tokens, batch], mirrored) reduced to each card's share of the features,
+// laid out as a column-split projection's output. Elsewhere: x unchanged.
+ggml_tensor* sd_tensor_split_select_features(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* x);
+
 #endif
