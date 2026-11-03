@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "core/ggml_extend_backend.h"
+#include "core/tensor_split.h"
 #include "core/ggml_graph_cut.h"
 #include "core/ggml_runner.h"
 #include "core/ggml_tensor_utils.h"
@@ -359,6 +360,16 @@ bool StableDiffusionGGML::register_runner_params(ModelComponent component,
         LOG_WARN("%s module does not support multiple runtime backends; using %s",
                  sd_backend_module_name(module),
                  sd::layer_split_backend_device_display_name(module_backends[0]).c_str());
+    }
+    if (ggml_backend_t meta = backend_for(module); sd_backend_is_tensor_split(meta)) {
+        // Tell the residency accounting which cards a tensor-split buffer occupies, as for a row split: a VAE
+        // decode on one of them can then evict these weights first (on one card sd.cpp releases them before the
+        // decode; without this it cannot see them there and the decode falls back to tiling).
+        std::vector<std::pair<ggml_backend_t, size_t>> cards;
+        for (ggml_backend_t card : sd_tensor_split_card_backends(meta)) {
+            cards.emplace_back(card, max_vram_assignment.bytes_for_backend(card));
+        }
+        model_manager->set_split_buffer_type(meta, ggml_backend_get_default_buffer_type(meta), cards);
     }
     return model_manager->register_param_tensors(component,
                                                  std::move(group_tensors),
