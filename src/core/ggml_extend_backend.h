@@ -45,6 +45,7 @@ enum class SDSplitMode {
     LAYER,
     ROW,
     TENSOR,  // ggml meta device: every split weight shared by all the module's GPUs (core/tensor_split.h)
+    SEQUENCE,  // ggml meta device: weights whole on every GPU, the tokens split between them (core/tensor_split.h)
 };
 
 class SDBackendManager {

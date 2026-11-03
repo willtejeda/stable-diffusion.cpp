@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "core/ggml_extensions.h"
 #include "core/util.h"
 
 // From ggml-backend-impl.h (internal, not on sd.cpp's include path): a meta backend's simple backends.
@@ -43,12 +44,15 @@ namespace {
             {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_out\.0\.weight$)"), 0, true},
             // the feature index tables of sd_tensor_split_select_features: split like the outputs above
             {std::regex(R"(^sd_tensor_split\.features\.\d+$)"), 0},
+            // the token index tables of sd_seq_split: each card its share of the tokens
+            {std::regex(R"(^sd_tensor_split\.tokens\.\d+$)"), 0},
         };
         return rules;
     }
 
     std::mutex g_mutex;
     std::unordered_set<ggml_backend_t> g_tensor_split_backends;
+    std::unordered_set<ggml_backend_t> g_sequence_split_backends;
 
     ggml_backend_meta_split_state mirrored() {
         ggml_backend_meta_split_state state = {};
@@ -106,6 +110,11 @@ ggml_backend_meta_split_state sd_tensor_split_state(const ggml_tensor* tensor, v
         return mirrored();
     }
     const std::string name = tensor->name;
+    // sequence split: every weight whole; only the token index tables are divided
+    static const std::regex token_table(R"(^sd_tensor_split\.tokens\.\d+$)");
+    if (ctx->sequence && !std::regex_search(name, token_table)) {
+        return mirrored();
+    }
     for (const SplitRule& rule : split_rules()) {
         if (rule.attention && !sd_tensor_split_attention_enabled()) {
             continue;
@@ -142,7 +151,16 @@ ggml_backend_t sd_tensor_split_backend_init(const std::vector<ggml_backend_dev_t
     if (backend != nullptr) {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_tensor_split_backends.insert(backend);
+        if (ctx->sequence) {
+            g_sequence_split_backends.insert(backend);
+        }
     }
+    // sd.cpp's fused RoPE and modulate work row by row: under a sequence split they run on each card's tokens
+    static std::once_flag row_local_once;
+    std::call_once(row_local_once, [] {
+        ggml_backend_meta_register_row_local_op(sd_ggml_rope_op());
+        ggml_backend_meta_register_row_local_op(sd_ggml_modulate_op());
+    });
     return backend;
 }
 
@@ -176,51 +194,57 @@ bool sd_buft_is_tensor_split(ggml_backend_buffer_type_t buft) {
 }
 
 namespace {
-    struct FeatureIndexCache {
+    struct IndexTableCache {
         std::mutex mutex;
-        std::unordered_map<ggml_backend_t, std::unordered_map<int64_t, ggml_tensor*>> tables;
+        std::unordered_map<ggml_backend_t, std::unordered_map<std::string, ggml_tensor*>> tables;
         std::vector<ggml_context*> contexts;  // kept for the life of the process, like the tables
     };
 
-    FeatureIndexCache& feature_index_cache() {
-        static FeatureIndexCache cache;
+    IndexTableCache& index_table_cache() {
+        static IndexTableCache cache;
         return cache;
+    }
+
+    // A static I32 table 0..n-1 named sd_tensor_split.<kind>.<n> in a weights-like buffer of a tensor-split backend:
+    // the split callback places each card's part of the indices on that card. Cached per backend, kind and n.
+    ggml_tensor* index_table(ggml_backend_t backend, const char* kind, int64_t n) {
+        if (!sd_backend_is_tensor_split(backend) || n <= 0) {
+            return nullptr;
+        }
+        const std::string name = std::string("sd_tensor_split.") + kind + "." + std::to_string(n);
+        auto& cache            = index_table_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto& tables = cache.tables[backend];
+        auto it      = tables.find(name);
+        if (it != tables.end()) {
+            return it->second;
+        }
+        ggml_init_params params = {ggml_tensor_overhead() * 2, nullptr, true};
+        ggml_context* ctx       = ggml_init(params);
+        if (ctx == nullptr) {
+            return nullptr;
+        }
+        ggml_tensor* table = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+        ggml_set_name(table, name.c_str());
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
+        if (buffer == nullptr) {
+            ggml_free(ctx);
+            return nullptr;
+        }
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<int32_t> values(static_cast<size_t>(n));
+        for (int64_t i = 0; i < n; i++) {
+            values[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+        }
+        ggml_backend_tensor_set(table, values.data(), 0, values.size() * sizeof(int32_t));
+        cache.contexts.push_back(ctx);
+        tables[name] = table;
+        return table;
     }
 }  // namespace
 
 ggml_tensor* sd_tensor_split_feature_index(ggml_backend_t backend, int64_t n) {
-    if (!sd_backend_is_tensor_split(backend) || n <= 0) {
-        return nullptr;
-    }
-    auto& cache = feature_index_cache();
-    std::lock_guard<std::mutex> lock(cache.mutex);
-    auto& tables = cache.tables[backend];
-    auto it      = tables.find(n);
-    if (it != tables.end()) {
-        return it->second;
-    }
-    ggml_init_params params = {ggml_tensor_overhead() * 2, nullptr, true};
-    ggml_context* ctx       = ggml_init(params);
-    if (ctx == nullptr) {
-        return nullptr;
-    }
-    ggml_tensor* table = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
-    ggml_set_name(table, ("sd_tensor_split.features." + std::to_string(n)).c_str());
-    // A weights-like buffer: the split callback places each card's half of the indices on that card.
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
-    if (buffer == nullptr) {
-        ggml_free(ctx);
-        return nullptr;
-    }
-    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    std::vector<int32_t> values(static_cast<size_t>(n));
-    for (int64_t i = 0; i < n; i++) {
-        values[static_cast<size_t>(i)] = static_cast<int32_t>(i);
-    }
-    ggml_backend_tensor_set(table, values.data(), 0, values.size() * sizeof(int32_t));
-    cache.contexts.push_back(ctx);
-    tables[n] = table;
-    return table;
+    return index_table(backend, "features", n);
 }
 
 ggml_tensor* sd_tensor_split_select_features(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* x) {
@@ -247,4 +271,33 @@ std::vector<ggml_backend_t> sd_tensor_split_card_backends(ggml_backend_t meta) {
         cards.push_back(ggml_backend_meta_simple_backend(meta, i));
     }
     return cards;
+}
+
+bool sd_backend_is_sequence_split(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_sequence_split_backends.count(backend) != 0;
+}
+
+ggml_tensor* sd_seq_split(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* x, int64_t n_tokens) {
+    if (!sd_backend_is_sequence_split(backend) || x == nullptr || n_tokens < 2) {
+        return x;
+    }
+    GGML_ASSERT(ggml_nelements(x) % n_tokens == 0);
+    ggml_tensor* index = index_table(backend, "tokens", n_tokens);
+    GGML_ASSERT(index != nullptr);
+    // one row per token; each card gathers its rows (ggml-backend-meta: get_rows of a whole table with split indices)
+    ggml_tensor* whole  = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+    ggml_tensor* rows   = ggml_reshape_2d(ctx, whole, ggml_nelements(x) / n_tokens, n_tokens);
+    ggml_tensor* picked = ggml_get_rows(ctx, rows, index);
+    return ggml_reshape_4d(ctx, picked, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+}
+
+ggml_tensor* sd_seq_gather(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* x) {
+    if (!sd_backend_is_sequence_split(backend) || x == nullptr) {
+        return x;
+    }
+    return ggml_backend_meta_all_gather(ctx, ggml_is_contiguous(x) ? x : ggml_cont(ctx, x));
 }

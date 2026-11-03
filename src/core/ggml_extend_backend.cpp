@@ -971,14 +971,15 @@ void SDBackendManager::ensure_tensor_split_backends() {
 // The module's meta backend when its split mode is tensor and it names two or more GPUs ("diffusion=cuda0&cuda1"),
 // else nullptr. Weights placed on it are split by core/tensor_split.cpp's rules; its device list is cached.
 ggml_backend_t SDBackendManager::tensor_split_backend(SDBackendModule module) {
-    if (split_mode(module) != SDSplitMode::TENSOR) {
+    const SDSplitMode mode = split_mode(module);
+    if (mode != SDSplitMode::TENSOR && mode != SDSplitMode::SEQUENCE) {
         return nullptr;
     }
     const std::vector<std::string> names = split_device_list(runtime_assignment_.get(module));
     if (names.size() < 2) {
         return nullptr;
     }
-    std::string key = "meta:";
+    std::string key = mode == SDSplitMode::SEQUENCE ? "meta-seq:" : "meta:";
     std::vector<ggml_backend_dev_t> devices;
     for (const std::string& name : names) {
         ggml_backend_dev_t device = resolve_named_device(name);
@@ -1000,12 +1001,17 @@ ggml_backend_t SDBackendManager::tensor_split_backend(SDBackendModule module) {
         return it->second.get();
     }
     auto ctx               = std::make_unique<SDTensorSplitContext>();
+    ctx->sequence          = mode == SDSplitMode::SEQUENCE;
     ggml_backend_t backend = sd_tensor_split_backend_init(devices, ctx.get());
     if (backend == nullptr) {
         LOG_ERROR("tensor split: could not create a meta device over %s", key.c_str());
         return nullptr;
     }
-    LOG_INFO("%s module: tensor split over %zu GPUs (%s)", sd_backend_module_name(module), devices.size(), key.c_str() + 5);
+    LOG_INFO("%s module: %s split over %zu GPUs (%s)",
+             sd_backend_module_name(module),
+             ctx->sequence ? "sequence" : "tensor",
+             devices.size(),
+             key.c_str() + key.find(':') + 1);
     tensor_split_contexts_.emplace(key, std::move(ctx));
     backends_.emplace(key, SDBackendHandle(backend));
     for (ggml_backend_t card : sd_tensor_split_card_backends(backend)) {
@@ -1112,6 +1118,9 @@ SDSplitMode SDBackendManager::split_mode(SDBackendModule module) const {
     if (mode == "tensor") {
         return SDSplitMode::TENSOR;
     }
+    if (mode == "seq" || mode == "sequence") {
+        return SDSplitMode::SEQUENCE;
+    }
     return SDSplitMode::LAYER;
 }
 
@@ -1205,11 +1214,12 @@ bool SDBackendManager::validate(std::string* error) const {
     };
     auto validate_split_mode_name = [&](const std::string& name) -> bool {
         const std::string lower = lower_copy(trim_copy(name));
-        if (lower.empty() || lower == "layer" || lower == "row" || lower == "tensor") {
+        if (lower.empty() || lower == "layer" || lower == "row" || lower == "tensor" || lower == "seq" ||
+            lower == "sequence") {
             return true;
         }
         if (error != nullptr) {
-            *error = "invalid split mode '" + name + "' (expected layer, row or tensor)";
+            *error = "invalid split mode '" + name + "' (expected layer, row, tensor or seq)";
         }
         return false;
     };

@@ -11,10 +11,27 @@
 
 #include "ggml-backend.h"
 
-// User data for the meta device's split callback: how many cards share a split tensor.
+// User data for the meta device's split callback: how many cards share a split tensor, and the strategy.
+//   tensor split (sequence = false): weights named by the rules are sliced across the cards, activations whole.
+//   sequence split (--split-mode <module>=seq): weights whole on every card; the model splits its tokens between the
+//   cards (sd_seq_split) and gathers them back where every card needs all of them (sd_seq_gather: attention K/V, the
+//   output). Nothing is computed twice, and only K/V cross the PCIe link, in fp16.
 struct SDTensorSplitContext {
     size_t n_devices = 0;
+    bool sequence    = false;
 };
+
+// True for a backend made by sd_tensor_split_backend_init() with a sequence-split context.
+bool sd_backend_is_sequence_split(ggml_backend_t backend);
+
+// On a sequence-split backend: x split between the cards by tokens. x is contiguous with its tokens outermost: viewed
+// as rows of nelements / n_tokens values, row t belongs to token t (e.g. an activation [features, tokens], or a RoPE
+// table [..., tokens * heads] with the heads inner). Elsewhere: x unchanged.
+ggml_tensor* sd_seq_split(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* x, int64_t n_tokens);
+
+// On a sequence-split backend: x (split by sd_seq_split along its outermost axis) whole on every card again.
+// Elsewhere: x unchanged.
+ggml_tensor* sd_seq_gather(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* x);
 
 // Stage B, the video attention split by heads: opt-in with SD_TENSOR_SPLIT_ATTN=1 while its head selection (full Q/K
 // transposes) costs more than it saves (Video/tensor-parallel-plan.md).

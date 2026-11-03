@@ -1933,9 +1933,27 @@ bool ModelManager::ensure_compute_backend_capacity(
         }
     }
 
+    // Weights on a tensor- or sequence-split backend live on each of its cards: they make room on any of them (e.g. the
+    // diffusion model before the VAE decodes on one of its cards).
+    std::vector<ggml_backend_t> split_cards_cache;
+    ggml_backend_t split_cards_owner = nullptr;
+    auto occupies_compute_backend    = [&](ggml_backend_t backend) {
+        if (backend == compute_backend) {
+            return true;
+        }
+        if (backend == nullptr || !sd_buft_is_tensor_split(ggml_backend_get_default_buffer_type(backend))) {
+            return false;
+        }
+        if (backend != split_cards_owner) {
+            split_cards_cache = sd_tensor_split_card_backends(backend);
+            split_cards_owner = backend;
+        }
+        return std::find(split_cards_cache.begin(), split_cards_cache.end(), compute_backend) != split_cards_cache.end();
+    };
+
     std::unordered_set<TensorState*> eviction_states;
     auto add_evictable_state = [&](TensorState* state) {
-        if (state == nullptr || state->compute_backend != compute_backend ||
+        if (state == nullptr || !occupies_compute_backend(state->compute_backend) ||
             state->pin_count > 0 || protected_states.find(state) != protected_states.end()) {
             return;
         }
@@ -2012,13 +2030,13 @@ bool ModelManager::ensure_compute_backend_capacity(
         return state != nullptr && state->tensor != nullptr && state->tensor->view_src == nullptr &&
                state->residency_mode == ResidencyMode::ParamBackend &&
                state->params_backend != nullptr && state->params_backend == state->compute_backend &&
-               state->compute_backend == compute_backend && !sd_backend_is_cpu(state->params_backend) &&
+               occupies_compute_backend(state->compute_backend) && !sd_backend_is_cpu(state->params_backend) &&
                state->pin_count == 0 && !state->staged_to_compute_backend && state->loaded_to_params_backend &&
                protected_states.find(state) == protected_states.end() &&
                required_set.find(state) == required_set.end() &&
                mapped_states.find(state) == mapped_states.end() &&
                !state->sources.empty() && state->applied_lora_epoch == UINT64_MAX &&
-               state->split_buffer_type == nullptr;
+               (state->split_buffer_type == nullptr || sd_buft_is_tensor_split(state->split_buffer_type));
     };
     for (TensorState* state : global_candidates) {
         if (!can_demote_to_disk(state)) {
