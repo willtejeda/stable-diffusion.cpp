@@ -714,7 +714,7 @@ namespace LTXV {
                 q = apply_hidden_rope(ctx, q, pe, heads, dim_head, rope_interleaved);
                 k = apply_hidden_rope(ctx, k, k_pe, heads, dim_head, rope_interleaved);
             }
-            if (tensor_split_heads && sd_backend_is_tensor_split(ctx->backend)) {
+            if (tensor_split_heads && sd_backend_is_tensor_split(ctx->backend) && sd_tensor_split_attention_enabled()) {
                 GGML_ASSERT(q->ne[0] == heads * dim_head && k->ne[0] == heads * dim_head);
                 q = sd_tensor_split_select_features(ctx->ggml_ctx, ctx->backend, q);
                 k = sd_tensor_split_select_features(ctx->ggml_ctx, ctx->backend, k);

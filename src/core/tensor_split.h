@@ -16,8 +16,15 @@ struct SDTensorSplitContext {
     size_t n_devices = 0;
 };
 
+// Stage B, the video attention split by heads: opt-in with SD_TENSOR_SPLIT_ATTN=1 while its head selection (full Q/K
+// transposes) costs more than it saves (Video/tensor-parallel-plan.md).
+bool sd_tensor_split_attention_enabled();
+
 // The meta device's split callback (ggml_backend_meta_get_split_state_t).
 ggml_backend_meta_split_state sd_tensor_split_state(const ggml_tensor* tensor, void* userdata);
+
+// A meta backend's per-card backends (owned by it).
+std::vector<ggml_backend_t> sd_tensor_split_card_backends(ggml_backend_t meta);
 
 // A meta backend over devices, or nullptr. ctx must outlive the backend.
 ggml_backend_t sd_tensor_split_backend_init(const std::vector<ggml_backend_dev_t>& devices, SDTensorSplitContext* ctx);

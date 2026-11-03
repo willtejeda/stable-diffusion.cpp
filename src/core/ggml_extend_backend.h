@@ -56,7 +56,12 @@ private:
     // is destroyed after them (a meta backend reads it).
     std::unordered_map<std::string, std::unique_ptr<SDTensorSplitContext>> tensor_split_contexts_;
     std::unordered_map<std::string, SDBackendHandle> backends_;
+    // A tensor-split meta backend's own per-card backends, lent to every other user of those GPUs (text encoder, VAE,
+    // upscaler): one backend, so one CUDA memory pool, per card. Owned by the meta backend; cleared before backends_.
+    std::unordered_map<ggml_backend_dev_t, ggml_backend_t> tensor_split_cards_;
+    bool tensor_split_ready_ = false;
     ggml_backend_t tensor_split_backend(SDBackendModule module);
+    void ensure_tensor_split_backends();
 
 public:
     SDBackendManager() = default;

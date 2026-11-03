@@ -9,6 +9,12 @@
 
 #include "core/util.h"
 
+// From ggml-backend-impl.h (internal, not on sd.cpp's include path): a meta backend's simple backends.
+extern "C" {
+GGML_API size_t ggml_backend_meta_n_backends(ggml_backend_t meta_backend);
+GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+}
+
 namespace {
 
     // Which weights are split, and along which ggml axis. A weight is [ne0 = in, ne1 = out]:
@@ -18,6 +24,7 @@ namespace {
     struct SplitRule {
         std::regex pattern;
         int axis;
+        bool attention = false;  // only with SD_TENSOR_SPLIT_ATTN=1 (stage B, slower than stage A for now)
     };
 
     const std::vector<SplitRule>& split_rules() {
@@ -29,11 +36,11 @@ namespace {
         static const std::vector<SplitRule> rules = {
             {std::regex(R"((^|\.)transformer_blocks\.\d+\.ff\.net\.0\.proj\.weight$)"), 1},
             {std::regex(R"((^|\.)transformer_blocks\.\d+\.ff\.net\.2\.weight$)"), 0},
-            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_v\.weight$)"), 1},
-            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_v\.bias$)"), 0},
-            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_gate_logits\.weight$)"), 1},
-            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_gate_logits\.bias$)"), 0},
-            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_out\.0\.weight$)"), 0},
+            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_v\.weight$)"), 1, true},
+            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_v\.bias$)"), 0, true},
+            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_gate_logits\.weight$)"), 1, true},
+            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_gate_logits\.bias$)"), 0, true},
+            {std::regex(R"((^|\.)transformer_blocks\.\d+\.attn[12]\.to_out\.0\.weight$)"), 0, true},
             // the feature index tables of sd_tensor_split_select_features: split like the outputs above
             {std::regex(R"(^sd_tensor_split\.features\.\d+$)"), 0},
         };
@@ -78,6 +85,14 @@ namespace {
 
 }  // namespace
 
+bool sd_tensor_split_attention_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SD_TENSOR_SPLIT_ATTN");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
 ggml_backend_meta_split_state sd_tensor_split_state(const ggml_tensor* tensor, void* userdata) {
     const auto* ctx = static_cast<const SDTensorSplitContext*>(userdata);
     if (ctx == nullptr || tensor == nullptr) {
@@ -92,6 +107,9 @@ ggml_backend_meta_split_state sd_tensor_split_state(const ggml_tensor* tensor, v
     }
     const std::string name = tensor->name;
     for (const SplitRule& rule : split_rules()) {
+        if (rule.attention && !sd_tensor_split_attention_enabled()) {
+            continue;
+        }
         if (!std::regex_search(name, rule.pattern)) {
             continue;
         }
@@ -218,4 +236,15 @@ ggml_tensor* sd_tensor_split_select_features(ggml_context* ctx, ggml_backend_t b
     ggml_tensor* picked    = ggml_get_rows(ctx, t, index);  // [rows, features], split along the features
     ggml_tensor* back      = ggml_cont(ctx, ggml_transpose(ctx, picked));
     return ggml_reshape_4d(ctx, back, features, x->ne[1], x->ne[2], x->ne[3]);
+}
+
+std::vector<ggml_backend_t> sd_tensor_split_card_backends(ggml_backend_t meta) {
+    std::vector<ggml_backend_t> cards;
+    if (!sd_backend_is_tensor_split(meta)) {
+        return cards;
+    }
+    for (size_t i = 0; i < ggml_backend_meta_n_backends(meta); i++) {
+        cards.push_back(ggml_backend_meta_simple_backend(meta, i));
+    }
+    return cards;
 }

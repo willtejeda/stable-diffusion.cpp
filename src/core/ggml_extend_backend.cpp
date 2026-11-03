@@ -902,6 +902,8 @@ SDBackendManager::~SDBackendManager() {
 }
 
 void SDBackendManager::reset() {
+    tensor_split_cards_.clear();  // borrowed from the meta backends freed next
+    tensor_split_ready_ = false;
     backends_.clear();
     tensor_split_contexts_.clear();  // after the meta backends that read them
     runtime_assignment_    = {};
@@ -932,6 +934,40 @@ ggml_backend_t SDBackendManager::runtime_backend(SDBackendModule module) {
     return init_cached_backend(primary_device_name(runtime_assignment_.get(module)));
 }
 
+// A named device without creating a backend for it (init_named_backend's lookup).
+static ggml_backend_dev_t resolve_named_device(const std::string& name) {
+    ggml_backend_load_all_once();
+    if (trim_copy(name).empty() || is_default_backend_token(name)) {
+        return nullptr;
+    }
+    if (ggml_backend_dev_t dev = resolve_device_by_name(name)) {
+        return dev;
+    }
+    if (ggml_backend_dev_t dev = resolve_first_device_by_registry_name(name)) {
+        return dev;
+    }
+    std::string resolved = sd_backend_resolve_name(name);
+    if (ggml_backend_dev_t dev = resolve_device_by_name(resolved)) {
+        return dev;
+    }
+    return resolve_first_device_by_registry_name(resolved);
+}
+
+// Create every tensor-split module's meta backend before any other backend, so the GPUs it spans get no second
+// backend (and no second CUDA memory pool) from init_cached_backend.
+void SDBackendManager::ensure_tensor_split_backends() {
+    if (tensor_split_ready_) {
+        return;
+    }
+    tensor_split_ready_ = true;
+    for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::TE, SDBackendModule::CLIP_VISION,
+                                   SDBackendModule::VAE, SDBackendModule::CONTROL_NET, SDBackendModule::PHOTOMAKER,
+                                   SDBackendModule::UPSCALER, SDBackendModule::DETECTOR,
+                                   SDBackendModule::AUDIO_ENCODER}) {
+        tensor_split_backend(module);
+    }
+}
+
 // The module's meta backend when its split mode is tensor and it names two or more GPUs ("diffusion=cuda0&cuda1"),
 // else nullptr. Weights placed on it are split by core/tensor_split.cpp's rules; its device list is cached.
 ggml_backend_t SDBackendManager::tensor_split_backend(SDBackendModule module) {
@@ -945,12 +981,11 @@ ggml_backend_t SDBackendManager::tensor_split_backend(SDBackendModule module) {
     std::string key = "meta:";
     std::vector<ggml_backend_dev_t> devices;
     for (const std::string& name : names) {
-        ggml_backend_t backend = init_cached_backend(name);
-        if (backend == nullptr || sd_backend_is_cpu(backend)) {
-            LOG_ERROR("tensor split: '%s' is not a GPU backend", name.c_str());
+        ggml_backend_dev_t device = resolve_named_device(name);
+        if (device == nullptr || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            LOG_ERROR("tensor split: '%s' is not a GPU", name.c_str());
             return nullptr;
         }
-        ggml_backend_dev_t device = ggml_backend_get_device(backend);
         if (std::find(devices.begin(), devices.end(), device) != devices.end()) {
             continue;
         }
@@ -973,6 +1008,10 @@ ggml_backend_t SDBackendManager::tensor_split_backend(SDBackendModule module) {
     LOG_INFO("%s module: tensor split over %zu GPUs (%s)", sd_backend_module_name(module), devices.size(), key.c_str() + 5);
     tensor_split_contexts_.emplace(key, std::move(ctx));
     backends_.emplace(key, SDBackendHandle(backend));
+    for (ggml_backend_t card : sd_tensor_split_card_backends(backend)) {
+        sd_ggml_register_extensions(card);  // per device: the cards run the fused ops of every module
+        tensor_split_cards_.emplace(ggml_backend_get_device(card), card);
+    }
     return backend;
 }
 
@@ -1199,6 +1238,15 @@ bool SDBackendManager::validate(std::string* error) const {
 }
 
 ggml_backend_t SDBackendManager::init_cached_backend(const std::string& name) {
+    ensure_tensor_split_backends();
+    if (!tensor_split_cards_.empty()) {
+        if (ggml_backend_dev_t dev = resolve_named_device(name)) {
+            auto card = tensor_split_cards_.find(dev);
+            if (card != tensor_split_cards_.end()) {
+                return card->second;  // lent by the tensor-split meta backend that owns it
+            }
+        }
+    }
     std::string resolved   = sd_backend_resolve_name(name);
     std::string key        = lower_copy(resolved);
     ggml_backend_t backend = nullptr;
