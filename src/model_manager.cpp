@@ -1794,8 +1794,10 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
     }
     auto add             = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
     const size_t missing = compute_backend_alloc_size(states, true);
-    // Backend scratch buffers and pipelines are not included in graph measurements.
-    size_t safety_margin = 512ULL * 1024ULL * 1024ULL;
+    // Backend scratch buffers and pipelines are not included in graph measurements, and an op's temporary buffers
+    // grow with its graph: a fifth of a large request (LTX's full-size VAE decode, 10.9 GB: 512 MB left sd-server
+    // ~1 GB short of an op's temporaries on a 16 GB card), at least 512 MB.
+    size_t safety_margin = std::max<size_t>(512ULL * 1024ULL * 1024ULL, request.pending_allocation_bytes / 5);
 #ifdef _WIN32
     if (sd_backend_is(request.compute_backend, "CUDA")) {
         // Avoid WDDM allocation churn when transient buffers compete with reusable staging buffers.
