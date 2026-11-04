@@ -158,8 +158,9 @@ ggml_backend_t sd_tensor_split_backend_init(const std::vector<ggml_backend_dev_t
     // sd.cpp's fused RoPE and modulate work row by row: under a sequence split they run on each card's tokens
     static std::once_flag row_local_once;
     std::call_once(row_local_once, [] {
-        ggml_backend_meta_register_row_local_op(sd_ggml_rope_op());
-        ggml_backend_meta_register_row_local_op(sd_ggml_modulate_op());
+        // rope_apply: x [d_head, heads, tokens, N] -> [d_head, tokens, heads * N], so the tokens are axis 1
+        ggml_backend_meta_register_row_local_op(sd_ggml_rope_op(), 1);
+        ggml_backend_meta_register_row_local_op(sd_ggml_modulate_op(), -1);
     });
     return backend;
 }

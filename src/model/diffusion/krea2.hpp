@@ -19,6 +19,7 @@
 #include "core/util.h"
 #include "model/common/ggml_block.hpp"
 #include "model/common/rope.hpp"
+#include "core/tensor_split.h"
 #include "model/diffusion/dit.hpp"
 #include "model/diffusion/flux.hpp"
 #include "model/diffusion/model.hpp"
@@ -261,10 +262,12 @@ namespace Krea2 {
             blocks["wo"]           = std::make_shared<Linear>(features, features, false);
         }
 
+        // k_pe: under --split-mode diffusion=seq, the whole RoPE table (pe is this card's share of it).
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
                              ggml_tensor* pe   = nullptr,
-                             ggml_tensor* mask = nullptr) {
+                             ggml_tensor* mask = nullptr,
+                             ggml_tensor* k_pe = nullptr) {
             auto wq    = std::dynamic_pointer_cast<Linear>(blocks["wq"]);
             auto wk    = std::dynamic_pointer_cast<Linear>(blocks["wk"]);
             auto wv    = std::dynamic_pointer_cast<Linear>(blocks["wv"]);
@@ -290,8 +293,21 @@ namespace Krea2 {
             q = qnorm->forward(ctx, q);
             k = knorm->forward(ctx, k);
 
-            auto out = pe != nullptr ? Rope::attention(ctx, q, k, v, pe, mask)
-                                     : attention_no_rope(ctx, q, k, v, mask);
+            ggml_tensor* out = nullptr;
+            if (pe != nullptr && k_pe != nullptr && sd_backend_is_sequence_split(ctx->backend)) {
+                // Sequence split: every card attends over all keys. K and V are gathered before RoPE (the tokens are
+                // their outermost axis there; after RoPE the heads are), in fp16; K is rotated with the whole table,
+                // Q with this card's share.
+                auto g = ctx->ggml_ctx;
+                k      = ggml_cast(g, sd_seq_gather(g, ctx->backend, ggml_cast(g, k, GGML_TYPE_F16)), GGML_TYPE_F32);
+                v      = sd_seq_gather(g, ctx->backend, ggml_cast(g, v, GGML_TYPE_F16));
+                q      = Rope::apply_rope(ctx, q, pe);
+                k      = Rope::apply_rope(ctx, k, k_pe);
+                out    = ggml_ext_attention_ext(ctx, q, k, v, heads, mask, true, ctx->flash_attn_enabled);
+            } else {
+                out = pe != nullptr ? Rope::attention(ctx, q, k, v, pe, mask)
+                                    : attention_no_rope(ctx, q, k, v, mask);
+            }
             out      = ggml_mul(ctx->ggml_ctx, out, ggml_sigmoid(ctx->ggml_ctx, gate->forward(ctx, x)));
             out      = wo->forward(ctx, out);
             return out;
@@ -439,7 +455,8 @@ namespace Krea2 {
                              ggml_tensor* vec,
                              ggml_tensor* pe,
                              ggml_tensor* vec_refs = nullptr,
-                             int64_t ref_start     = -1) {
+                             int64_t ref_start     = -1,
+                             ggml_tensor* k_pe     = nullptr) {
             auto mod      = std::dynamic_pointer_cast<KreaDoubleSharedModulation>(blocks["mod"]);
             auto prenorm  = std::dynamic_pointer_cast<KreaRMSNorm>(blocks["prenorm"]);
             auto postnorm = std::dynamic_pointer_cast<KreaRMSNorm>(blocks["postnorm"]);
@@ -508,7 +525,7 @@ namespace Krea2 {
                                                  mods[1],
                                                  mods[0],
                                                  true);
-                auto attn_out   = attn->forward(ctx, attn_input, pe);
+                auto attn_out   = attn->forward(ctx, attn_input, pe, nullptr, k_pe);
                 x               = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, attn_out, mods[2]));
 
                 auto mlp_input = Flux::modulate(ctx,
@@ -677,10 +694,25 @@ namespace Krea2 {
 
             auto hidden_states = ggml_concat(ctx->ggml_ctx, txt, img, 1);
             int64_t ref_start  = hidden_states->ne[1] - ref_len;
+
+            // --split-mode diffusion=seq: each card carries its share of the joint (text + image) tokens through the
+            // blocks, with its share of the RoPE table; K/V are gathered in attention. Edits with reference images
+            // (per-token modulation by views) stay whole for now.
+            ggml_tensor* k_pe = nullptr;
+            const bool seq    = sd_backend_is_sequence_split(ctx->backend) && ref_latents.empty();
+            if (seq) {
+                const int64_t n_tokens = hidden_states->ne[1];
+                hidden_states          = sd_seq_split(ctx->ggml_ctx, ctx->backend, hidden_states, n_tokens);
+                k_pe                   = pe;
+                pe                     = sd_seq_split(ctx->ggml_ctx, ctx->backend, pe, n_tokens);
+            }
             for (int i = 0; i < config.layers; ++i) {
                 auto block    = std::dynamic_pointer_cast<KreaSingleStreamBlock>(blocks["blocks." + std::to_string(i)]);
-                hidden_states = block->forward(ctx, hidden_states, tvec, pe, tvec_0, ref_start);
+                hidden_states = block->forward(ctx, hidden_states, tvec, pe, tvec_0, ref_start, k_pe);
                 sd::ggml_graph_cut::mark_graph_cut(hidden_states, "krea2.blocks." + std::to_string(i), "hidden_states");
+            }
+            if (seq) {
+                hidden_states = sd_seq_gather(ctx->ggml_ctx, ctx->backend, hidden_states);  // all tokens again
             }
 
             hidden_states = ggml_ext_slice(ctx->ggml_ctx, hidden_states, 1, txt_len, txt_len + img_len);
