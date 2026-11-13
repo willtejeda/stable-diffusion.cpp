@@ -1629,7 +1629,10 @@ namespace sd::pipeline {
         }
         bool latent_upscale_enabled     = request.hires.enabled;
         GenerationRequest hires_request = request;
-        if (latent_upscale_enabled) {
+        // p100: coarse-to-fine for MiniMax-H3: the first pass at the request size, the clean latent resized
+        // (bicubic) to the hires target, re-noised by the refine sigmas, last step(s) at full size. No upscaler model.
+        const bool h3_coarse_to_fine = latent_upscale_enabled && sd_version_is_minimax_h3(sd->version);
+        if (latent_upscale_enabled && !h3_coarse_to_fine) {
             if (!sd_version_is_ltxav(sd->version)) {
                 LOG_ERROR("LTX latent spatial upscale is only supported for LTX video models");
                 return false;
@@ -1780,11 +1783,29 @@ namespace sd::pipeline {
                 LOG_ERROR("cancelling generation before latent upscale");
                 return false;
             }
-            int64_t upscale_start             = ggml_time_ms();
-            sd::Tensor<float> upscaled_latent = upscale_ltx_spatial_video_latent(sd,
-                                                                                 request.hires.model_path,
-                                                                                 final_latent,
-                                                                                 latents.audio_length);
+            int64_t upscale_start = ggml_time_ms();
+            sd::Tensor<float> upscaled_latent;
+            if (h3_coarse_to_fine) {
+                const int latent_channels = sd->get_latent_channel();
+                int target_w              = request.hires.target_width > 0 ? request.hires.target_width : request.width * 2;
+                int target_h              = request.hires.target_height > 0 ? request.hires.target_height : request.height * 2;
+                sd::Tensor<float> video   = final_latent.shape()[3] > latent_channels
+                                                ? sd::ops::slice(final_latent, 3, 0, latent_channels)
+                                                : final_latent;
+                sd::Tensor<float> audio   = unpack_minimax_h3_audio_latent(final_latent, latents.audio_length, latent_channels);
+                std::vector<int64_t> shape = video.shape();
+                shape[0]                   = target_w / hires_request.vae_scale_factor;
+                shape[1]                   = target_h / hires_request.vae_scale_factor;
+                video                      = sd::ops::interpolate(video, shape, sd::ops::InterpolateMode::Bicubic);
+                upscaled_latent            = audio.empty() ? video : pack_ltxav_audio_and_video_latents(video, audio);
+                LOG_INFO("H3 coarse-to-fine: latent %dx%d -> %dx%d",
+                         (int)final_latent.shape()[0], (int)final_latent.shape()[1], (int)shape[0], (int)shape[1]);
+            } else {
+                upscaled_latent = upscale_ltx_spatial_video_latent(sd,
+                                                                   request.hires.model_path,
+                                                                   final_latent,
+                                                                   latents.audio_length);
+            }
             int64_t upscale_end               = ggml_time_ms();
             if (upscaled_latent.empty()) {
                 return false;
@@ -1843,7 +1864,8 @@ namespace sd::pipeline {
                 LOG_ERROR("cancelling generation before latent upscale refine");
                 return false;
             }
-            if (!apply_ltxv_refine_image_conditioning(sd,
+            if (!h3_coarse_to_fine &&
+                !apply_ltxv_refine_image_conditioning(sd,
                                                       sd_vid_gen_params,
                                                       hires_request,
                                                       latents,
