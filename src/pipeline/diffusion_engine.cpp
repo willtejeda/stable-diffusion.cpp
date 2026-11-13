@@ -3007,24 +3007,32 @@ sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float
     if (sd_version_is_pid(version) || sd_version_is_minit2i(version) || version == VERSION_IRIS) {
         return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
     }
-    auto latents                      = first_stage_model->diffusion_to_vae_latents(x);
-    auto tiling_params                = first_stage_model->resolve_tiling_params(vae_tiling_params);
+    // P100: SD_TAE_FINAL_DECODE=1 with --taesd-preview-only decodes the final output with the tiny decoder while the
+    // full VAE stays the first-stage model (LTX's latent upscale needs its normalisation statistics; its weights are
+    // never staged if it does not compute).
+    static const bool tae_final = [] { const char* e = getenv("SD_TAE_FINAL_DECODE"); return e && atoi(e) != 0; }();
+    const auto& decoder         = (tae_final && preview_vae) ? preview_vae : first_stage_model;
+    if (tae_final && preview_vae) {
+        LOG_INFO("final decode with the tiny decoder (SD_TAE_FINAL_DECODE)");
+    }
+    auto latents                      = decoder->diffusion_to_vae_latents(x);
+    auto tiling_params                = decoder->resolve_tiling_params(vae_tiling_params);
     const bool prefer_temporal_tiling = decode_video && latents.dim() == 5 && latents.shape()[2] > 1 &&
-                                        first_stage_model->can_temporal_tile_decode();
+                                        decoder->can_temporal_tile_decode();
     for (;;) {
         int tile_size_w = static_cast<int>(latents.shape()[0]);
         int tile_size_h = static_cast<int>(latents.shape()[1]);
         float tile_overlap;
         if (tiling_params.enabled &&
-            !first_stage_model->get_tile_sizes(tile_size_w, tile_size_h, tile_overlap, tiling_params,
+            !decoder->get_tile_sizes(tile_size_w, tile_size_h, tile_overlap, tiling_params,
                                                latents.shape()[0], latents.shape()[1])) {
             return {};
         }
-        auto decoded = first_stage_model->decode(n_threads, latents, tiling_params, decode_video, circular_x, circular_y);
+        auto decoded = decoder->decode(n_threads, latents, tiling_params, decode_video, circular_x, circular_y);
         if (!decoded.empty() ||
             !sd::backend_fit::prepare_vae_decode_retry_tiling(tiling_params, prefer_temporal_tiling,
-                                                              first_stage_model->last_compute_status(),
-                                                              tile_size_w, tile_size_h, first_stage_model->get_scale_factor())) {
+                                                              decoder->last_compute_status(),
+                                                              tile_size_w, tile_size_h, decoder->get_scale_factor())) {
             return decoded;
         }
     }
