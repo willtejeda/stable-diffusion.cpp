@@ -107,6 +107,52 @@ namespace Flux3 {
             }
             return out;
         }
+
+        std::pair<ggml_tensor*, ggml_tensor*> forward_sequence(
+            GGMLRunnerContext* ctx, ggml_tensor* image, ggml_tensor* text,
+            const Flux::ModulationOut& image_mod, const Flux::ModulationOut& text_mod,
+            ggml_tensor* local_image_pe, ggml_tensor* image_pe, ggml_tensor* text_pe) {
+            auto gc = ctx->ggml_ctx;
+            struct Stream {
+                ggml_tensor *x, *modulated, *q, *k, *v;
+            };
+            auto norm = std::dynamic_pointer_cast<Flux::QKNorm>(blocks["norm"]);
+            auto prepare = [&](ggml_tensor* x, const Flux::ModulationOut& mod) {
+                auto xm = Flux::modulate(ctx, ggml_norm(gc, x, 1e-6f), mod.shift, mod.scale);
+                auto split = [&](ggml_tensor* v) {
+                    return ggml_reshape_4d(gc, v, x->ne[0] / heads, heads, x->ne[1], x->ne[2]);
+                };
+                return Stream{x, xm,
+                              norm->query_norm(ctx, split(linear(ctx, "q_proj", xm))),
+                              norm->key_norm(ctx, split(linear(ctx, "k_proj", xm))),
+                              split(linear(ctx, "v_proj", xm))};
+            };
+            auto image_stream = prepare(image, image_mod);
+            auto image_k = ggml_cast(gc, sd_seq_gather(gc, ctx->backend, ggml_cast(gc, image_stream.k, GGML_TYPE_F16)), GGML_TYPE_F32);
+            auto image_v = sd_seq_gather(gc, ctx->backend, ggml_cast(gc, image_stream.v, GGML_TYPE_F16));
+            auto image_q = Rope::apply_rope(ctx, image_stream.q, local_image_pe);
+            image_k = Rope::apply_rope(ctx, image_k, image_pe);
+            ggml_tensor* keys = image_k;
+            ggml_tensor* values = image_v;
+            Stream text_stream{};
+            ggml_tensor* text_q = nullptr;
+            if (text) {
+                text_stream = prepare(text, text_mod);
+                text_q = Rope::apply_rope(ctx, text_stream.q, text_pe);
+                auto text_k = Rope::apply_rope(ctx, text_stream.k, text_pe);
+                keys = ggml_concat(gc, image_k, text_k, 1);
+                values = ggml_concat(gc, image_v, ggml_cast(gc, text_stream.v, GGML_TYPE_F16), 2);
+            }
+            auto finish = [&](const Stream& stream, ggml_tensor* q, const Flux::ModulationOut& mod) {
+                auto attn = ggml_ext_attention_ext(ctx, q, keys, values, heads, nullptr, true, ctx->flash_attn_enabled, 1.f);
+                auto mlp = ggml_ext_silu_act(gc, linear(ctx, "mlp_in", stream.modulated));
+                auto update = ggml_add(gc, linear(ctx, "attn_out", attn), linear(ctx, "mlp_out", mlp));
+                return ggml_add(gc, stream.x, ggml_mul(gc, update, mod.gate));
+            };
+            auto image_out = finish(image_stream, image_q, image_mod);
+            auto text_out = text ? finish(text_stream, text_q, text_mod) : nullptr;
+            return {image_out, text_out};
+        }
     };
 
     struct Model : public GGMLBlock {
@@ -147,6 +193,40 @@ namespace Flux3 {
                 auto ref_vec  = ref_time->forward(ctx, ggml_ext_timestep_embedding(gc, target, 256, 10000, 1000.f));
                 image_vec     = ggml_add(gc, image_vec, ref_vec);
                 clean_vec     = ggml_add(gc, clean_vec, ref_vec);
+            }
+            // Keep reference-image edits on the whole-token path. A mirrored
+            // text suffix cannot be concatenated onto split image activations.
+            if (!reference && sd_backend_is_sequence_split(ctx->backend) &&
+                image->ne[3] == 1 && text->ne[2] == 1 && width * height >= 2) {
+                const int64_t tokens = width * height;
+                auto image_pe = ggml_ext_slice(gc, pe, 3, 0, tokens);
+                auto text_pe = ggml_ext_slice(gc, pe, 3, tokens, pe->ne[3]);
+                auto local_pe = sd_seq_split(gc, ctx->backend, image_pe, tokens);
+                auto img = std::dynamic_pointer_cast<Linear>(blocks["emb_in.image"])->forward(ctx, DiT::patchify(gc, image, 1, 1));
+                auto txt = std::dynamic_pointer_cast<Linear>(blocks["txt_in"])->forward(ctx, text);
+                img = sd_seq_split(gc, ctx->backend, img, tokens);
+                auto modulation = [&](const std::string& stage, const std::string& mode, ggml_tensor* vec) {
+                    return std::dynamic_pointer_cast<Flux::Modulation>(blocks[stage + "." + mode])->forward(ctx, vec)[0];
+                };
+                auto image_early = modulation("early_stream_modulations", "image", image_vec);
+                auto text_early = modulation("early_stream_modulations", "txt", clean_vec);
+                for (int i = 0; i < config.depth; ++i) {
+                    img = std::dynamic_pointer_cast<Block>(blocks["content_mode_blocks.image." + std::to_string(i)])->forward_sequence(
+                        ctx, img, nullptr, image_early, text_early, local_pe, image_pe, nullptr).first;
+                    txt = std::dynamic_pointer_cast<Block>(blocks["txt_mode_blocks." + std::to_string(i)])->forward(
+                        ctx, txt, text_pe, {text_early}, {txt->ne[1]});
+                }
+                auto image_mod = modulation("single_stream_modulations", "image", image_vec);
+                auto text_mod = modulation("single_stream_modulations", "txt", clean_vec);
+                for (int i = 0; i < config.single_depth; ++i) {
+                    auto out = std::dynamic_pointer_cast<Block>(blocks["single_blocks." + std::to_string(i)])->forward_sequence(
+                        ctx, img, txt, image_mod, text_mod, local_pe, image_pe, text_pe);
+                    img = out.first;
+                    txt = out.second;
+                }
+                auto out = std::dynamic_pointer_cast<Flux::LastLayer>(blocks["final_layer.image"])->forward(ctx, img, image_vec);
+                out = sd_seq_gather(gc, ctx->backend, out);
+                return DiT::unpatchify(gc, out, height, width, 1, 1);
             }
             std::vector<std::string> modes{"image"};
             std::vector<ggml_tensor*> inputs{DiT::patchify(gc, image, 1, 1)};

@@ -142,6 +142,53 @@ namespace MOSSImage {
             y            = ggml_mul(c, y, part(5));
             return ggml_add(c, x, y);
         }
+
+        std::pair<ggml_tensor*, ggml_tensor*> forward_sequence(
+            GGMLRunnerContext* ctx, ggml_tensor* image, ggml_tensor* text,
+            ggml_tensor* local_image_pe, ggml_tensor* image_pe, ggml_tensor* text_pe,
+            const std::array<ggml_tensor*, 6>& mod) {
+            auto c = ctx->ggml_ctx;
+            auto linear = [&](const char* name, ggml_tensor* h) { return std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, h); };
+            auto norm = [&](const char* name, ggml_tensor* h) { return std::dynamic_pointer_cast<RMSNorm>(blocks[name])->forward(ctx, h); };
+            struct Stream {
+                ggml_tensor *x, *q, *k, *v;
+            };
+            auto prepare = [&](ggml_tensor* x) {
+                auto y = norm("norm1", x);
+                y = ggml_add(c, ggml_add(c, y, ggml_mul(c, y, mod[1])), mod[0]);
+                auto qkv = linear("proj.qkv", y);
+                auto part = [&](int i) {
+                    return ggml_view_4d(c, qkv, config.head_dim, config.dim / config.head_dim, x->ne[1], x->ne[2],
+                                        config.head_dim * qkv->nb[0], qkv->nb[1], qkv->nb[2], i * config.dim * qkv->nb[0]);
+                };
+                return Stream{x, norm("q_norm", part(0)), norm("k_norm", part(1)), part(2)};
+            };
+            auto img = prepare(image);
+            auto txt = prepare(text);
+            // Exchange unrotated image K/V in FP16; text remains mirrored on both cards.
+            auto img_k = ggml_cast(c, sd_seq_gather(c, ctx->backend, ggml_cast(c, img.k, GGML_TYPE_F16)), GGML_TYPE_F32);
+            auto img_v = sd_seq_gather(c, ctx->backend, ggml_cast(c, img.v, GGML_TYPE_F16));
+            auto txt_v = ggml_cast(c, txt.v, GGML_TYPE_F16);
+            auto img_q = Rope::apply_rope(ctx, img.q, local_image_pe, false);
+            img_k = Rope::apply_rope(ctx, img_k, image_pe, false);
+            auto txt_q = Rope::apply_rope(ctx, txt.q, text_pe, false);
+            auto txt_k = Rope::apply_rope(ctx, txt.k, text_pe, false);
+            auto k = ggml_concat(c, img_k, txt_k, 1);
+            auto v = ggml_concat(c, img_v, txt_v, 2);
+            const auto heads = config.dim / config.head_dim;
+            auto finish = [&](Stream& stream, ggml_tensor* q) {
+                auto y = ggml_ext_attention_ext(ctx, q, k, v, heads, nullptr, true, ctx->flash_attn_enabled, 1.f);
+                y = ggml_mul(c, linear("proj.o", y), mod[2]);
+                auto x = ggml_add(c, stream.x, y);
+                y = norm("norm2", x);
+                y = ggml_add(c, ggml_add(c, y, ggml_mul(c, y, mod[4])), mod[3]);
+                auto up_gate = linear("proj.ffn_up_gate", y);
+                y = situ(c, ggml_ext_slice(c, up_gate, 0, 0, config.ffn_dim), ggml_ext_slice(c, up_gate, 0, config.ffn_dim, 2 * config.ffn_dim));
+                y = ggml_mul(c, linear("proj.ffn_down", y), mod[5]);
+                return ggml_add(c, x, y);
+            };
+            return {finish(img, img_q), finish(txt, txt_q)};
+        }
     };
 
     struct Model : public GGMLBlock {
@@ -185,19 +232,40 @@ namespace MOSSImage {
                     ggml_build_forward_expand(ctx->graph, parts[i]);
                 }
             }
-            x = ggml_concat(c, x, text, 1);
+            const bool sequence = sd_backend_is_sequence_split(ctx->backend) && x->ne[2] == 1 && image_len >= 2;
+            ggml_tensor *image_pe = nullptr, *local_image_pe = nullptr;
+            if (sequence) {
+                image_pe = ggml_ext_slice(c, pe, 3, 0, image_len);
+                local_image_pe = sd_seq_split(c, ctx->backend, image_pe, image_len);
+                x = sd_seq_split(c, ctx->backend, x, image_len);
+            } else {
+                x = ggml_concat(c, x, text, 1);
+            }
             for (int64_t i = 0; i < config.depth; ++i) {
                 if (std::find(skip.begin(), skip.end(), i) == skip.end()) {
-                    x = std::dynamic_pointer_cast<Block>(blocks["layers." + std::to_string(i)])->forward(ctx, x, pe, parts);
+                    auto block = std::dynamic_pointer_cast<Block>(blocks["layers." + std::to_string(i)]);
+                    if (sequence) {
+                        auto out = block->forward_sequence(ctx, x, text, local_image_pe, image_pe, text_pe, parts);
+                        x = out.first;
+                        text = out.second;
+                        sd::ggml_graph_cut::mark_graph_cut(text, "moss_image.layers." + std::to_string(i), "text");
+                    } else {
+                        x = block->forward(ctx, x, pe, parts);
+                    }
                     sd::ggml_graph_cut::mark_graph_cut(x, "moss_image.layers." + std::to_string(i), "x");
                 }
             }
-            x          = ggml_ext_slice(c, x, 1, 0, image_len);
+            if (!sequence) {
+                x = ggml_ext_slice(c, x, 1, 0, image_len);
+            }
             x          = std::dynamic_pointer_cast<RMSNorm>(blocks["final_norm_video"])->forward(ctx, x);
             auto shift = ggml_ext_slice(c, head, 0, 0, config.dim);
             auto scale = ggml_ext_slice(c, head, 0, config.dim, 2 * config.dim);
             x          = ggml_add(c, ggml_add(c, x, ggml_mul(c, x, scale)), shift);
             x          = linear("final_linear_video", x);
+            if (sequence) {
+                x = sd_seq_gather(c, ctx->backend, x);
+            }
             return DiT::unpatchify(c, x, image->ne[1], image->ne[0], 1, 1);
         }
     };

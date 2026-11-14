@@ -350,8 +350,10 @@ namespace Qwen {
 
                 // mod_result = torch.where(index == 0, mod_0, mod_1)
                 // mod_result = (1 - index)*mod_0 + index*mod_1
-                mod_0           = ggml_sub(ctx, ggml_repeat(ctx, mod_0, index), ggml_mul(ctx, index, mod_0));  // [N, n_img_token, hidden_size]
-                mod_1           = ggml_mul(ctx, index, mod_1);                                                 // [N, n_img_token, hidden_size]
+                // Keep the token-shaped operand first: the meta backend can
+                // broadcast a mirrored channel vector over local token rows.
+                mod_0 = ggml_add(ctx, ggml_scale(ctx, ggml_mul(ctx, index, mod_0), -1.f), mod_0);
+                mod_1 = ggml_mul(ctx, index, mod_1);
                 auto mod_result = ggml_add(ctx, mod_0, mod_1);
                 mod_results.push_back(mod_result);
             }
@@ -519,12 +521,17 @@ namespace Qwen {
 
             ggml_tensor* local_img_pe = nullptr;
             const bool seq = allow_sequence && sd_backend_is_sequence_split(ctx->backend) &&
-                             img->ne[2] == 1 && modulate_index == nullptr && img->ne[1] >= 2;
+                             img->ne[2] == 1 && img->ne[1] >= 2;
             if (seq) {
                 const int64_t tokens = img->ne[1];
                 img = sd_seq_split(ctx->ggml_ctx, ctx->backend, img, tokens);
                 auto img_pe = ggml_ext_slice(ctx->ggml_ctx, pe, 3, txt->ne[1], pe->ne[3]);
                 local_img_pe = sd_seq_split(ctx->ggml_ctx, ctx->backend, img_pe, tokens);
+                if (modulate_index != nullptr) {
+                    // Reference tokens use the zero-timestep modulation. Its token
+                    // index must follow the same uneven image/reference partition.
+                    modulate_index = sd_seq_split(ctx->ggml_ctx, ctx->backend, modulate_index, tokens);
+                }
             }
 
             for (int i = 0; i < config.num_layers; i++) {
@@ -597,7 +604,7 @@ namespace Qwen {
             }
 
             auto out = forward_orig(ctx, img, timestep, addition_t_cond, context, pe, modulate_index,
-                                    ref_latents.empty() && !has_time_axis);  // reference edits stay whole
+                                    !has_time_axis);
 
             if (out->ne[1] > img_tokens) {
                 out = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, out, 0, 2, 1, 3));  // [num_tokens, N, C * patch_size * patch_size]

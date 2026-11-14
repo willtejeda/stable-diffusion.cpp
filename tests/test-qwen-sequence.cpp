@@ -15,6 +15,7 @@ static std::vector<float> run(bool split, bool version21, bool gpu) {
     split_context.sequence = true;
     auto backend = split && gpu ? sd_tensor_split_backend_init(
         {ggml_backend_get_device(single), ggml_backend_dev_by_name("CUDA1")}, &split_context) : single;
+    for (auto card : sd_tensor_split_card_backends(backend)) sd_ggml_register_extensions(card);
     auto weights_ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
     auto ctx = ggml_init({32 * 1024 * 1024, nullptr, true});
     constexpr int64_t dim = 256, head = 128, text_tokens = 3, image_tokens = 7;
