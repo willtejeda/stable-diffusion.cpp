@@ -5,6 +5,7 @@
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_tensor_utils.h"
 #include "core/pe_cache.h"
+#include "core/tensor_split.h"
 
 #include "core/util.h"
 #include "model/common/block.hpp"
@@ -125,6 +126,39 @@ namespace Qwen {
         }
     };
 
+    // Image queries stay local; text queries stay mirrored. Never concatenate a
+    // mirrored prefix with split queries: that is not a contiguous token split.
+    // K/V are exchanged in FP16 while tokens are outermost, before fused RoPE.
+    static std::pair<ggml_tensor*, ggml_tensor*> sequence_attention(
+        GGMLRunnerContext* ctx,
+        ggml_tensor* img_q, ggml_tensor* img_k, ggml_tensor* img_v,
+        ggml_tensor* txt_q, ggml_tensor* txt_k, ggml_tensor* txt_v,
+        ggml_tensor* local_img_pe, ggml_tensor* img_pe, ggml_tensor* txt_pe,
+        float kv_scale, bool causal_text = false, ggml_tensor* txt_mask = nullptr) {
+        auto g = ctx->ggml_ctx;
+        const int64_t heads = img_q->ne[1];
+        img_k = ggml_cast(g, sd_seq_gather(g, ctx->backend, ggml_cast(g, img_k, GGML_TYPE_F16)), GGML_TYPE_F32);
+        img_v = sd_seq_gather(g, ctx->backend, ggml_cast(g, img_v, GGML_TYPE_F16));
+        // Older Qwen scales V before attention; SCALE needs FP32 on CPU.
+        // Qwen 2.1 uses unity scale, so retain the exchanged FP16 values.
+        if (kv_scale != 1.f) {
+            img_v = ggml_cast(g, img_v, GGML_TYPE_F32);
+        } else {
+            txt_v = ggml_cast(g, txt_v, GGML_TYPE_F16);
+        }
+        img_q = Rope::apply_rope(ctx, img_q, local_img_pe);
+        img_k = Rope::apply_rope(ctx, img_k, img_pe);
+        txt_q = Rope::apply_rope(ctx, txt_q, txt_pe);
+        txt_k = Rope::apply_rope(ctx, txt_k, txt_pe);
+        auto k = ggml_concat(g, txt_k, img_k, 1);
+        auto v = ggml_concat(g, txt_v, img_v, 2);
+        auto img_out = ggml_ext_attention_ext(ctx, img_q, k, v, heads, nullptr, true, ctx->flash_attn_enabled, kv_scale);
+        auto txt_out = ggml_ext_attention_ext(ctx, txt_q, causal_text ? txt_k : k,
+                                             causal_text ? txt_v : v, heads, txt_mask,
+                                             true, ctx->flash_attn_enabled, kv_scale);
+        return {img_out, txt_out};
+    }
+
     struct QwenImageAttention : public GGMLBlock {
     protected:
         int64_t dim_head;
@@ -172,7 +206,8 @@ namespace Qwen {
                                                       ggml_tensor* img,
                                                       ggml_tensor* txt,
                                                       ggml_tensor* pe,
-                                                      ggml_tensor* mask = nullptr) {
+                                                      ggml_tensor* mask = nullptr,
+                                                      ggml_tensor* local_img_pe = nullptr) {
             // img: [N, n_img_token, hidden_size]
             // txt: [N, n_txt_token, hidden_size]
             // pe: [n_img_token + n_txt_token, d_head/2, 2, 2]
@@ -222,6 +257,15 @@ namespace Qwen {
 
             txt_q = norm_added_q->forward(ctx, txt_q);
             txt_k = norm_added_k->forward(ctx, txt_k);
+
+            if (local_img_pe != nullptr) {
+                GGML_ASSERT(mask == nullptr && N == 1);
+                auto txt_pe = ggml_ext_slice(ctx->ggml_ctx, pe, 3, 0, n_txt_token);
+                auto img_pe = ggml_ext_slice(ctx->ggml_ctx, pe, 3, n_txt_token, pe->ne[3]);
+                auto out = sequence_attention(ctx, img_q, img_k, img_v, txt_q, txt_k, txt_v,
+                                              local_img_pe, img_pe, txt_pe, 1.f / 128.f);
+                return {to_out_0->forward(ctx, out.first), to_add_out->forward(ctx, out.second)};
+            }
 
             auto q = ggml_concat(ctx->ggml_ctx, txt_q, img_q, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
             auto k = ggml_concat(ctx->ggml_ctx, txt_k, img_k, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
@@ -319,7 +363,8 @@ namespace Qwen {
                                                               ggml_tensor* txt,
                                                               ggml_tensor* t_emb,
                                                               ggml_tensor* pe,
-                                                              ggml_tensor* modulate_index = nullptr) {
+                                                              ggml_tensor* modulate_index = nullptr,
+                                                              ggml_tensor* local_img_pe = nullptr) {
             // img: [N, n_img_token, hidden_size]
             // txt: [N, n_txt_token, hidden_size]
             // pe: [n_img_token + n_txt_token, d_head/2, 2, 2]
@@ -357,7 +402,7 @@ namespace Qwen {
             auto txt_modulated = Flux::modulate(ctx, txt_normed, txt_mod_param_vec[0], txt_mod_param_vec[1]);
             auto txt_gate1     = txt_mod_param_vec[2];
 
-            auto [img_attn_output, txt_attn_output] = attn->forward(ctx, img_modulated, txt_modulated, pe);
+            auto [img_attn_output, txt_attn_output] = attn->forward(ctx, img_modulated, txt_modulated, pe, nullptr, local_img_pe);
 
             img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_attn_output, img_gate1));
             txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn_output, txt_gate1));
@@ -451,7 +496,8 @@ namespace Qwen {
                                   ggml_tensor* addition_t_cond,
                                   ggml_tensor* context,
                                   ggml_tensor* pe,
-                                  ggml_tensor* modulate_index = nullptr) {
+                                  ggml_tensor* modulate_index = nullptr,
+                                  bool allow_sequence = false) {
             auto time_text_embed = std::dynamic_pointer_cast<QwenTimestepProjEmbeddings>(blocks["time_text_embed"]);
             auto txt_norm        = std::dynamic_pointer_cast<RMSNorm>(blocks["txt_norm"]);
             auto img_in          = std::dynamic_pointer_cast<Linear>(blocks["img_in"]);
@@ -471,10 +517,20 @@ namespace Qwen {
             sd::ggml_graph_cut::mark_graph_cut(txt, "qwen_image.prelude", "txt");
             // sd::ggml_graph_cut::mark_graph_cut(t_emb, "qwen_image.prelude", "t_emb");
 
+            ggml_tensor* local_img_pe = nullptr;
+            const bool seq = allow_sequence && sd_backend_is_sequence_split(ctx->backend) &&
+                             img->ne[2] == 1 && modulate_index == nullptr && img->ne[1] >= 2;
+            if (seq) {
+                const int64_t tokens = img->ne[1];
+                img = sd_seq_split(ctx->ggml_ctx, ctx->backend, img, tokens);
+                auto img_pe = ggml_ext_slice(ctx->ggml_ctx, pe, 3, txt->ne[1], pe->ne[3]);
+                local_img_pe = sd_seq_split(ctx->ggml_ctx, ctx->backend, img_pe, tokens);
+            }
+
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<QwenImageTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
 
-                auto result = block->forward(ctx, img, txt, t_emb, pe, modulate_index);
+                auto result = block->forward(ctx, img, txt, t_emb, pe, modulate_index, local_img_pe);
                 img         = result.first;
                 txt         = result.second;
                 sd::ggml_graph_cut::mark_graph_cut(img, "qwen_image.transformer_blocks." + std::to_string(i), "img");
@@ -487,6 +543,9 @@ namespace Qwen {
 
             img = norm_out->forward(ctx, img, t_emb);
             img = proj_out->forward(ctx, img);
+            if (seq) {
+                img = sd_seq_gather(ctx->ggml_ctx, ctx->backend, img);
+            }
 
             return img;
         }
@@ -537,7 +596,8 @@ namespace Qwen {
                 }
             }
 
-            auto out = forward_orig(ctx, img, timestep, addition_t_cond, context, pe, modulate_index);  // [N, h_len*w_len, ph*pw*C]
+            auto out = forward_orig(ctx, img, timestep, addition_t_cond, context, pe, modulate_index,
+                                    ref_latents.empty() && !has_time_axis);  // reference edits stay whole
 
             if (out->ne[1] > img_tokens) {
                 out = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, out, 0, 2, 1, 3));  // [num_tokens, N, C * patch_size * patch_size]

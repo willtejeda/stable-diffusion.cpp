@@ -863,7 +863,10 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
     const auto params       = collect_used_param_tensors(graph);
     const auto& cached_plan = resolve_graph_cut_plan(graph);
     auto manager            = residency_manager.lock();
-    const bool can_segment  = !is_multi_device() && !sd_backend_is_cpu(runtime_backend) &&
+    // Cut caches rebind tensor storage without preserving the meta backend's identity/split state.
+    // Keep meta graphs resident; capacity preparation can reclaim the other stages' weights first.
+    const bool can_segment  = !is_multi_device() && !sd_backend_is_tensor_split(runtime_backend) &&
+                              !sd_backend_is_cpu(runtime_backend) &&
                               manager != nullptr && manager->segmented_compute_enabled() &&
                               cached_plan.valid && cached_plan.has_cuts && cached_plan.segments.size() > 1;
     // An empty workspace request is a lower bound on the full graph's memory demand.

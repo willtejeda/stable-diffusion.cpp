@@ -1939,8 +1939,12 @@ bool ModelManager::ensure_compute_backend_capacity(
     // diffusion model before the VAE decodes on one of its cards).
     std::vector<ggml_backend_t> split_cards_cache;
     ggml_backend_t split_cards_owner = nullptr;
+    const auto requested_cards = sd_backend_is_tensor_split(compute_backend)
+                                     ? sd_tensor_split_card_backends(compute_backend)
+                                     : std::vector<ggml_backend_t>{};
     auto occupies_compute_backend    = [&](ggml_backend_t backend) {
-        if (backend == compute_backend) {
+        if (backend == compute_backend ||
+            std::find(requested_cards.begin(), requested_cards.end(), backend) != requested_cards.end()) {
             return true;
         }
         if (backend == nullptr || !sd_buft_is_tensor_split(ggml_backend_get_default_buffer_type(backend))) {

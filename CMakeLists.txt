@@ -79,7 +79,7 @@ endif()
 #
 
 # general
-#option(SD_BUILD_TESTS                "sd: build tests"    ${SD_STANDALONE})
+option(SD_BUILD_TESTS                "sd: build tests" OFF)
 option(SD_BUILD_EXAMPLES             "sd: build examples" ${SD_STANDALONE})
 option(SD_WEBP                       "sd: enable WebP image I/O support" ${SD_WEBP_DEFAULT})
 option(SD_USE_SYSTEM_WEBP            "sd: link against system libwebp" OFF)
@@ -402,6 +402,18 @@ target_compile_features(${SD_LIB} PUBLIC c_std_11 cxx_std_17)
 
 if (SD_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if (SD_BUILD_TESTS)
+    enable_testing()
+    add_executable(test-minimax-h3-modulation tests/test-minimax-h3-modulation.cpp)
+    target_include_directories(test-minimax-h3-modulation PRIVATE src src/core)
+    target_link_libraries(test-minimax-h3-modulation PRIVATE stable-diffusion)
+    add_test(NAME minimax-h3-modulation COMMAND test-minimax-h3-modulation)
+    add_executable(test-qwen-sequence tests/test-qwen-sequence.cpp)
+    target_include_directories(test-qwen-sequence PRIVATE src src/core)
+    target_link_libraries(test-qwen-sequence PRIVATE stable-diffusion)
+    add_test(NAME qwen-sequence COMMAND test-qwen-sequence)
 endif()
 
 

@@ -19,5 +19,18 @@
 
 <img alt="qwen example" src="../assets/qwen/example.png" />
 
+## Two-GPU sequence split
+
+For single-image text-to-image with batch one, use:
+
+```text
+--backend 'diffusion=cuda0&cuda1,te=cuda0,vae=cuda0' --params-backend te=cpu --auto-fit off --split-mode diffusion=seq
+```
+
+Image tokens and image RoPE rows are split after the input projection. The text stream is mirrored. Joint attention gathers FP16 image K/V before RoPE, keeps text before image in K/V order, and evaluates mirrored text queries separately from local image queries. The image output is gathered after the final projection. Both GPUs hold the full diffusion weights.
+
+Reference-image edits and zero-condition timestep-indexed variants (including the current Qwen Edit preset) remain unsplit. Their ordinary execution path is preserved; this does not add sequence splitting for edits. Dual-stream attention has a tiny deterministic CPU/two-GPU numerical test; real-weight image and timing measurements currently cover Qwen Image 2.1 Turbo only. See [Qwen Image 2.1](qwen_image_2.1.md#two-gpu-sequence-split) for tests and measurement commands.
+
+
 
 

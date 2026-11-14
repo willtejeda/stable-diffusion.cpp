@@ -42,6 +42,44 @@ For [Qwen Image 2.1 Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo), us
 
 The preset is equivalent to `--sigmas 1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0`. It only supplies the sigma values; CFG scale and sampling method remain independently configurable. As with an explicit sigma list, the sigma count determines the actual number of sampling steps. The same preset name is also accepted by `--hires-sigmas` for the highres fix second pass.
 
+### Two-GPU sequence split
+
+For text-to-image, add these options (replace rather than duplicate existing backend options):
+
+```text
+--backend 'diffusion=cuda0&cuda1,te=cuda0,vae=cuda0' --params-backend te=cpu --auto-fit off --split-mode diffusion=seq
+```
+
+Weights are mirrored. Image tokens and their RoPE rows are split after the image input projection; text stays whole on each GPU. Each block gathers FP16 image K/V before RoPE and preserves text-first attention order. Text attention remains causal and cannot see the target image. The image output is gathered before unpatchifying. Both GPUs must fit the mirrored diffusion weights and their local working buffers.
+
+Prefix caching is disabled on the sequence backend; the short text prefix is recomputed each step. Reference-image edits keep the full, unsplit graph. They are not an edit sequence-split implementation.
+
+`test-qwen-sequence` checks separate-stream versus whole-stream attention and modulation with nonidentity RoPE, a causal text mask, and uneven image token counts. Its default run uses CPU; `--cuda` checks actual two-GPU collectives and token partitioning. Run that option only with the GPUs reserved. `tests/bench-qwen-sequence.py SIZE launcher|single|sequence` reproduces the local Turbo measurements and records commands, wall time, logs, and sampled VRAM under `build-h3seq`; it must be run inside a GPU lease.
+
+#### Measured on the two P100s
+
+Q6_K Turbo diffusion, Q4_K_M Qwen3-VL text encoder, original BF16 VAE file, Euler, fixed Turbo sigmas, CFG 1, eight steps, seed 42. Prompt: “A studio photograph of a red ceramic teapot with a curved handle and short spout, on a pale grey table, soft even lighting, three-quarter view, one object, no text.”
+
+The read-only `run_sd.sh qwen21turbo --dry-run` preset assigns diffusion to CUDA1 and TE/VAE to CUDA0. It is a two-card **stage placement**, not a diffusion layer split. `launcher` below preserves those flags. `single` uses only physical GPU1; sequence uses the options above. All measurements used this worktree's `build-h3seq/bin/sd-cli`, not the installed server.
+
+| Requested → actual size | Mode | Last denoising step s/it | Cold command wall s | Sampled peak MiB GPU0 / GPU1 | RGB PSNR vs launcher |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1024 → 1024 | launcher | 5.93 | 74.48 | 13419 / 7665 | — |
+| 1024 → 1024 | single | 6.07 | 77.20 | 0 / 14103 | — |
+| 1024 → 1024 | sequence | 4.18 | 62.01 | 15159 / 7477 | 27.46 dB |
+| 1328 → 1344 | launcher | 13.24 | 143.16 | 4693 / 8479 | — |
+| 1328 → 1344 | single | 13.51 | 144.51 | 0 / 12787 | — |
+| 1328 → 1344 | sequence | 7.98 | 106.39 | 8167 / 8167 | 42.50 dB |
+
+These are single cold CLI runs, not repeated server throughput measurements. s/it is the logged eighth denoising step, not wall time divided by eight. Sampling totals (including first-step lazy weight loading) were 59.18 / 59.81 / 44.90 s at 1024 and 114.67 / 116.26 / 75.22 s at the larger size, in launcher / single / sequence order. The final sequence runs were remeasured after retaining unity-scale V in FP16 rather than redundantly widening and narrowing it. Both numerical GPU tests still passed (maximum absolute errors 0.00006134 dual-stream, 0.00001848 causal block).
+
+The CLI rounded 1328 to actual 1344×1344 PNGs. All three larger runs rejected untiled VAE decoding for insufficient memory and automatically retried with spatial tiles; they completed successfully. Maximum sampled GPU temperature over the reported runs was 80 °C. VRAM is whole-command `nvidia-smi` sampling every 500 ms, including TE and VAE; it is not just diffusion memory. Automatic placement/retention can change those peaks.
+
+PSNR was measured with `ffmpeg -lavfi psnr`; default RGBA averages were 28.71 and 43.74 dB. The table conservatively removes alpha with `format=gbrp` on both inputs (27.46 and 42.50 dB). Both images retain the same teapot scene.
+
+Images: `/tmp/codex-shots/qwenseq-{1024,1328}-{launcher,single,sequence}.png`. Commands, seed, prompt, wall time, and sampled peaks are in `build-h3seq/qwenseq-measurements.jsonl` (last sequence entry per size is final). Per-case logs and VRAM CSVs use the same stems; `*-pre-v16*` artifacts retain the earlier sequence implementation's measurements. PSNR logs are `build-h3seq/qwenseq-{1024,1328}-{rgb-,}psnr.log`. No installed launcher, binary, model, or Hostler configuration was changed.
+
+
 ### Image editing
 
 Pass the reference image with `-r` and describe the edit in `-p`. Vision weights are required; the example below loads them separately with `--llm_vision`.

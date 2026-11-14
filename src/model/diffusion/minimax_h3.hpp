@@ -238,10 +238,11 @@ namespace MiniMaxH3 {
                   float eps)
             : heads(heads), head_dim(head_dim) {
             int64_t inner      = heads * head_dim;
-            blocks["qkv_proj"] = std::make_shared<Linear>(hidden_size, inner * 3, false);
+            // H3 turbo needs F32 accumulation to avoid grey/black output on Pascal.
+            blocks["qkv_proj"] = std::make_shared<Linear>(hidden_size, inner * 3, false, false, true);
             blocks["q_norm"]   = std::make_shared<RMSNorm>(head_dim, eps);
             blocks["k_norm"]   = std::make_shared<RMSNorm>(head_dim, eps);
-            blocks["out_proj"] = std::make_shared<Linear>(inner, hidden_size, false);
+            blocks["out_proj"] = std::make_shared<Linear>(inner, hidden_size, false, false, true);
         }
 
         ggml_tensor* project_qkv(GGMLRunnerContext* ctx, ggml_tensor* x) {
@@ -254,7 +255,8 @@ namespace MiniMaxH3 {
 
         ggml_tensor* attend(GGMLRunnerContext* ctx,
                             ggml_tensor* projected,
-                            ggml_tensor* pe = nullptr) {
+                            ggml_tensor* pe = nullptr,
+                            ggml_tensor* k_pe = nullptr) {
             auto q_norm      = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
             auto k_norm      = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
             int64_t sequence = projected->ne[1];
@@ -269,9 +271,21 @@ namespace MiniMaxH3 {
             auto v = view(2);
             q      = q_norm->forward(ctx, q);
             k      = k_norm->forward(ctx, k);
+            if (k_pe != nullptr && sd_backend_is_sequence_split(ctx->backend)) {
+                // Transfer K/V in FP16, then restore F32 for RoPE and the attention
+                // helper's 1/128 scaling (SCALE has no FP16 CPU/CUDA implementation).
+                k = ggml_cast(ctx->ggml_ctx,
+                              sd_seq_gather(ctx->ggml_ctx, ctx->backend,
+                                            ggml_cast(ctx->ggml_ctx, k, GGML_TYPE_F16)),
+                              GGML_TYPE_F32);
+                v = ggml_cast(ctx->ggml_ctx,
+                              sd_seq_gather(ctx->ggml_ctx, ctx->backend,
+                                            ggml_cast(ctx->ggml_ctx, v, GGML_TYPE_F16)),
+                              GGML_TYPE_F32);
+            }
             if (pe != nullptr) {
                 q = apply_partial_rope(ctx, q, pe);
-                k = apply_partial_rope(ctx, k, pe);
+                k = apply_partial_rope(ctx, k, k_pe != nullptr ? k_pe : pe);
             } else {
                 q = attention_layout(ctx->ggml_ctx, q);
                 k = attention_layout(ctx->ggml_ctx, k);
@@ -375,6 +389,22 @@ namespace MiniMaxH3 {
         int64_t modulation_row;
     };
 
+    static std::vector<int32_t> modulation_indices(const std::vector<TokenModulationSpan>& segments,
+                                                    int64_t tokens) {
+        GGML_ASSERT(tokens > 0);
+        std::vector<int32_t> indices(tokens);
+        int64_t next = 0;
+        for (const auto& segment : segments) {
+            GGML_ASSERT(segment.start == next && segment.end > segment.start && segment.end <= tokens);
+            GGML_ASSERT(segment.modulation_row >= 0 && segment.modulation_row <= INT32_MAX);
+            std::fill(indices.begin() + segment.start, indices.begin() + segment.end,
+                      static_cast<int32_t>(segment.modulation_row));
+            next = segment.end;
+        }
+        GGML_ASSERT(next == tokens);
+        return indices;
+    }
+
     enum class SequenceKind {
         TEXT,
         CONDITION_VIDEO,
@@ -430,13 +460,32 @@ namespace MiniMaxH3 {
                              ggml_tensor* x,
                              ggml_tensor* t_emb,
                              const std::vector<TokenModulationSpan>& segments,
-                             ggml_tensor* pe) {
+                             ggml_tensor* pe,
+                             ggml_tensor* token_index = nullptr,
+                             ggml_tensor* k_pe = nullptr) {
             auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
             auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
             auto attn  = std::dynamic_pointer_cast<Attention>(blocks["attn"]);
             auto mlp   = std::dynamic_pointer_cast<MLP>(blocks["mlp"]);
             auto adaln = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
             auto mods  = adaln->forward(ctx, t_emb);
+
+            if (token_index != nullptr) {
+                auto table = ggml_reshape_2d(ctx->ggml_ctx, mods, config.hidden_size * 6, mods->ne[1] * 3);
+                auto pick = [&](int component) {
+                    // Gather components only where consumed: never materialize a
+                    // [6 * hidden, tokens] modulation tensor beside QKV/the MLP.
+                    auto rows = ggml_view_2d(ctx->ggml_ctx, table, config.hidden_size, table->ne[1],
+                                            table->nb[1], component * config.hidden_size * table->nb[0]);
+                    return ggml_get_rows(ctx->ggml_ctx, rows, token_index);
+                };
+                auto h = ggml_ext_modulate(ctx, norm1->forward(ctx, x), pick(0), pick(1));
+                h      = attn->project_qkv(ctx, h);
+                h      = attn->project_output(ctx, attn->attend(ctx, h, pe, k_pe));
+                auto residual = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, h, pick(2)));
+                h = ggml_ext_modulate(ctx, norm2->forward(ctx, residual), pick(3), pick(4));
+                return ggml_add(ctx->ggml_ctx, residual, ggml_mul(ctx->ggml_ctx, mlp->forward(ctx, h), pick(5)));
+            }
 
             std::vector<std::vector<ggml_tensor*>> rows;
             std::vector<ggml_tensor*> inputs;
@@ -523,7 +572,7 @@ namespace MiniMaxH3 {
             int64_t video_dim          = config.video_latent_channels * config.patch_t * config.patch_h * config.patch_w;
             blocks["video_patch_proj"] = std::make_shared<Linear>(video_dim, config.hidden_size, true, true);
             blocks["audio_patch_proj"] = std::make_shared<Linear>(config.audio_latent_channels, config.hidden_size, true, true);
-            blocks["condition_proj"]   = std::make_shared<Linear>(config.text_dim, config.hidden_size, true);
+            blocks["condition_proj"]   = std::make_shared<Linear>(config.text_dim, config.hidden_size, true, false, true);
             if (!config.uses_adaln_curves()) {
                 blocks["time_embedder"] = std::make_shared<TimeEmbedder>(config.timestep_input_dim,
                                                                          config.time_embed_hidden_size,
@@ -621,7 +670,8 @@ namespace MiniMaxH3 {
                                                       const std::vector<TokenModulationSpan>& segments,
                                                       const std::vector<SequenceSegment>& sequence_segments,
                                                       const TokenModulationSpan& video_segment,
-                                                      const TokenModulationSpan& audio_segment) {
+                                                      const TokenModulationSpan& audio_segment,
+                                                      ggml_tensor* token_index = nullptr) {
             auto video_proj = std::dynamic_pointer_cast<Linear>(blocks["video_patch_proj"]);
             auto audio_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patch_proj"]);
 
@@ -714,13 +764,24 @@ namespace MiniMaxH3 {
                                         curve_upper_indices,
                                         curve_fractions);
             auto pe    = build_rope(ctx, position_ids);
+            ggml_tensor* k_pe = nullptr;
+            if (sd_backend_is_sequence_split(ctx->backend)) {
+                GGML_ASSERT(h->ne[2] == 1 && h->ne[3] == 1 && token_index != nullptr);
+                const int64_t tokens = h->ne[1];
+                GGML_ASSERT(ggml_nelements(token_index) == tokens);
+                h           = sd_seq_split(ctx->ggml_ctx, ctx->backend, h, tokens);
+                k_pe        = pe;
+                pe          = sd_seq_split(ctx->ggml_ctx, ctx->backend, pe, tokens);
+                token_index = sd_seq_split(ctx->ggml_ctx, ctx->backend, token_index, tokens);
+            }
             for (int64_t i = 0; i < config.num_layers; ++i) {
                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
-                h          = block->forward(ctx, h, t_emb, segments, pe);
+                h          = block->forward(ctx, h, t_emb, segments, pe, token_index, k_pe);
                 sd::ggml_graph_cut::mark_graph_cut(h,
                                                    "minimax_h3.blocks." + std::to_string(i),
                                                    "hidden_states");
             }
+            h = sd_seq_gather(ctx->ggml_ctx, ctx->backend, h);
 
             auto final_layer = std::dynamic_pointer_cast<FinalLayer>(blocks["final_layer"]);
             auto output      = final_layer->forward(ctx, h, t_emb, video_segment, audio_segment);
@@ -985,6 +1046,7 @@ namespace MiniMaxH3 {
         sd::Tensor<int32_t> curve_index_input_cache;
         sd::Tensor<int32_t> curve_upper_index_input_cache;
         sd::Tensor<float> curve_fraction_input_cache;
+        sd::Tensor<int32_t> modulation_index_input_cache;
 
         MiniMaxH3Runner(ggml_backend_t backend,
                         const String2TensorStorage& tensors,
@@ -1092,6 +1154,13 @@ namespace MiniMaxH3 {
                 {3, static_cast<int64_t>(layout.positions.size() / 3)},
                 layout.positions);
             auto positions = make_input(position_input_cache);
+            ggml_tensor* token_index = nullptr;
+            if (sd_backend_is_sequence_split(runtime_backend)) {
+                const int64_t tokens = static_cast<int64_t>(layout.positions.size() / 3);
+                modulation_index_input_cache = sd::Tensor<int32_t>(
+                    {tokens}, modulation_indices(layout.segments, tokens));
+                token_index = make_input(modulation_index_input_cache);
+            }
 
             ggml_tensor* timestep_features   = nullptr;
             ggml_tensor* curve_indices       = nullptr;
@@ -1147,7 +1216,8 @@ namespace MiniMaxH3 {
                                             layout.segments,
                                             layout.sequence_segments,
                                             layout.video_segment,
-                                            layout.audio_segment);
+                                            layout.audio_segment,
+                                            token_index);
             // Convert the model's audio velocity to d(c_a) / d(sigma_v).
             output.second = ggml_add(compute_ctx,
                                      ggml_ext_scale(compute_ctx, audio, 1.f - audio_scale),

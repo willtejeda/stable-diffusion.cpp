@@ -106,3 +106,73 @@ frame rate and optional soundtrack; non-24-fps inputs are resampled internally.
 - MiniMax-H3 runs at 24 fps; another requested value is overridden.
 - The default video flow shift is 12. The audio stream is mapped internally to
   its shift of 3, so the regular samplers can operate on the packed AV latent.
+
+## Sequence split validation status (h3-seq, task 17b continuation)
+
+The experimental joint-sequence path splits hidden states, RoPE and I32 modulation-row
+indices after patch projection/concatenation. Each block gathers modulation components
+per token. Attention transfers K/V in FP16, then restores F32 for RoPE and the `1/128`
+attention scaling; SCALE does not support FP16 on this branch. Weights remain mirrored.
+The original segment-based single-card path is retained.
+
+### Single-card precision: fixed
+
+H3's QKV, attention output and condition projections now explicitly require F32
+accumulation, like its feed-forward projections. The previous grey/black output was
+resolved first on the unchanged branch by setting `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32`
+(the H3-specific extra in `Video/videobench.py`, not just FAST_ENV). The model-specific
+fix also renders correctly with that environment override unset. No p100k kernel
+commits were ported; the branch uses its existing F32 cuBLAS path.
+
+At 512x288x22, seed 42, four-step Pika LoRA, full video/audio VAEs:
+
+- Working p100k reference: warm steps 2–4 average 6.50 s/it, process wall 147.12 s.
+- Fixed branch: 9.35 s/it, process wall 152.89 s.
+- FFmpeg all-frame PSNR against p100k: 23.35 dB, below 25 dB. First/middle/last
+  frames visibly show the same black tumbler/silver mountain engraving scene, with
+  differing detail; this is visual scene agreement, not pixel-equivalence.
+
+The fixed one-card 1280x704x56 run also completed with `--max-vram 13`: warm
+170.43 s/it, wall 859.89 s, peak GPU1 14,745 MiB, peak host RAM 41.12 GiB.
+Frames 0/28/55 visibly retain the tumbler/engraving scene. FFprobe confirms 56
+video frames and an audio stream; audio content was not listened to.
+
+### Two-card sequence split: blocked by memory and cut-cache semantics
+
+Removing `--max-vram` alone did not prevent automatic cutting: both 512x288x22 and
+1280x704x56 still selected 54 segments. The added meta diagnostic identified:
+
+```text
+node=62 op=ADD
+ggml_runner_cut:minimax_h3.token_refiner.blocks.0|hidden_states|
+```
+
+`GraphCutTensorCache::bind_outputs` transplants a duplicate tensor's buffer/data/extra
+onto the graph tensor. The meta buffer's simple-tensor map is keyed by tensor identity,
+so the original graph node has no entry. Cached OP_NONE copies also do not preserve
+the graph-derived token split state. A pointer alias alone would not make segmented
+sequence execution correct.
+
+Meta graphs are therefore kept monolithic, not silently cut. Residency reclamation
+now also handles the inverse stage transition: a meta requester can evict parked
+single-card text-encoder weights on either constituent card.
+
+With videobench Q assignments and `--params-backend te=cpu,vae=cpu`, no VRAM cap:
+
+- The runtime LoRA raises resident weights from 10,975.95 to 14,706.95 MiB per card.
+  At 512x288x22, one denoising step completed; step 2 was rejected by the capacity
+  check (910.10 MiB needed, 603.66 MiB free). Peak observed VRAM was 16,081 MiB/card.
+  The request includes 398.10 MiB pending allocation plus the existing 512 MiB safety
+  reserve; this was a policy rejection, not an observed CUDA allocation failure.
+- At 1280x704x56, capacity preparation rejected 20,741.88 MiB needed against
+  15,675.12 MiB free before step 1. No 121-frame test was attempted.
+- An explicit `--lora-apply-mode immediately` smoke also failed: the scheduler
+  rejected CPY into the preallocated Meta quantized `blocks.0.attn.out_proj.weight`.
+  It is not a validated workaround.
+
+There is no completed split clip, warm split timing, speedup or one-vs-two-card PSNR.
+The deterministic CPU block test (`-DSD_BUILD_TESTS=ON`, CTest
+`minimax-h3-modulation`) passes for linear and curve modulation; it does not establish
+GPU split correctness. Commands, environments, sampling logs and metrics are retained
+under `build-h3seq/runs/h3seq2-*`; first/middle/last reference and fixed one-card PNGs
+are under `/tmp/codex-shots/h3seq2-*.png`.
