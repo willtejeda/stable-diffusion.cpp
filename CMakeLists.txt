@@ -426,6 +426,31 @@ if (SD_BUILD_TESTS)
     target_include_directories(test-qwen-edit-sequence PRIVATE src src/core)
     target_link_libraries(test-qwen-edit-sequence PRIVATE stable-diffusion)
     add_test(NAME qwen-edit-sequence COMMAND test-qwen-edit-sequence)
+    add_executable(test-ref-max-side
+        tests/test-ref-max-side.cpp
+        examples/common/common.cpp
+        examples/common/generation_metadata.cpp
+        examples/common/log.cpp
+        examples/common/media_io.cpp
+        examples/common/media_metadata.cpp)
+    target_include_directories(test-ref-max-side PRIVATE examples src src/core)
+    target_link_libraries(test-ref-max-side PRIVATE stable-diffusion zip ${CMAKE_THREAD_LIBS_INIT})
+    target_compile_features(test-ref-max-side PRIVATE cxx_std_17)
+    if(SD_WEBP)
+        target_compile_definitions(test-ref-max-side PRIVATE SD_USE_WEBP)
+        target_link_libraries(test-ref-max-side PRIVATE webp libwebpmux)
+    endif()
+    if(SD_WEBM)
+        target_compile_definitions(test-ref-max-side PRIVATE SD_USE_WEBM)
+        target_link_libraries(test-ref-max-side PRIVATE webm)
+    endif()
+    add_test(NAME ref-max-side COMMAND test-ref-max-side)
+    if(SD_CUDA AND NOT SD_USE_UPSTREAM_GGML)
+        add_executable(test-cuda-cache-clear tests/test-cuda-cache-clear.cpp)
+        target_link_libraries(test-cuda-cache-clear PRIVATE ggml-cuda ggml)
+        add_test(NAME cuda-cache-clear COMMAND test-cuda-cache-clear)
+        set_tests_properties(cuda-cache-clear PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+    endif()
     add_executable(bake-task30-h3 tests/bake-task30-h3.cpp)
     target_include_directories(bake-task30-h3 PRIVATE src src/core)
     target_link_libraries(bake-task30-h3 PRIVATE stable-diffusion)

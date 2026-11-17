@@ -151,6 +151,7 @@ static json make_img_gen_defaults_json(const SDGenerationParams& defaults, const
         {"batch_count", defaults.batch_count},
         {"qwen_image_layers", defaults.qwen_image_layers},
         {"ref_image_args", defaults.ref_image_args},
+        {"ref_max_side", defaults.ref_max_side},
         {"image_preprocess", defaults.image_preprocess},
         {"increase_ref_index", defaults.increase_ref_index},
         {"control_strength", defaults.control_strength},

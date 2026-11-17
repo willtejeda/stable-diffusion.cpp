@@ -2062,13 +2062,14 @@ bool ModelManager::ensure_compute_backend_capacity(
     if (!capacity.requires_reclamation && capacity.fits()) {
         return true;
     }
-    if (sd_backend_is(compute_backend, "Vulkan") &&
-        capacity.required_budget_bytes <= capacity.available_budget_bytes) {
+    if (capacity.required_budget_bytes <= capacity.available_budget_bytes) {
         ggml_backend_synchronize(compute_backend);
         sd_backend_clear_buffer_cache(compute_backend);
-        // Vulkan heap usage can lag behind buffer releases. Fast memory queries
-        // must not turn that reporting delay into an allocation failure.
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        // Idle backend scratch is not runner residency. Trim it before refusing
+        // an otherwise valid allocation; Vulkan alone needs a heap-report delay.
+        const auto delay = sd_backend_is(compute_backend, "Vulkan") ? std::chrono::milliseconds(100)
+                                                                   : std::chrono::milliseconds(0);
+        const auto deadline = std::chrono::steady_clock::now() + delay;
         for (;;) {
             capacity = check_capacity(request, required_states);
             if (!capacity.requires_reclamation && capacity.fits()) {

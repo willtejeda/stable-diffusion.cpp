@@ -2,6 +2,7 @@
 #include "core/util.h"
 
 #include <climits>
+#include <cstring>
 #include <set>
 
 namespace sd {
@@ -453,12 +454,17 @@ namespace sd {
         return true;
     }
 
-    bool ImagePreprocessor::prepare_inputs(sd_img_gen_params_t& params, int width, int height) {
+    bool ImagePreprocessor::prepare_inputs(sd_img_gen_params_t& params, int width, int height, bool qwen) {
         if (prepared_)
             return fail("inputs have already been prepared");
         prepared_ = true;
         if (!valid_ || !validate_inputs(params))
             return false;
+        if (params.ref_max_side < 0 || params.ref_max_side > 8192)
+            return fail("ref_max_side must be between 0 and 8192");
+        if (qwen && params.ref_images_count > 0 && params.ref_max_side > 0 && params.ref_max_side < 16)
+            return fail("ref_max_side must be at least 16 for Qwen reference images");
+        const int cap = qwen && params.ref_max_side > 0 ? params.ref_max_side / 16 * 16 : params.ref_max_side;
         if (!prepare_image(params.init_image, ImageTarget::Init, 0, width, height) ||
             !prepare_image(params.mask_image, ImageTarget::Mask, 0, width, height) ||
             !prepare_image(params.control_image, ImageTarget::Control, 0, width, height) ||
@@ -466,7 +472,70 @@ namespace sd {
             !prepare_array(params.ref_images, params.ref_images_count, ImageTarget::Ref, ref_images_) ||
             !prepare_array(params.pm_params.id_images, params.pm_params.id_images_count, ImageTarget::ID, id_images_))
             return false;
+        if (cap > 0) {
+            for (int i = 0; i < params.ref_images_count; ++i) {
+                auto& image = ref_images_[i];
+                const int w = static_cast<int>(image.width);
+                const int h = static_cast<int>(image.height);
+                const int longest = std::max(w, h);
+                if (longest <= cap)
+                    continue;
+                ImageTransform plan;
+                plan.source_width = plan.crop_width = w;
+                plan.source_height = plan.crop_height = h;
+                plan.width = plan.resize_width = std::max(1, static_cast<int>((int64_t(w) * cap + longest / 2) / longest));
+                plan.height = plan.resize_height = std::max(1, static_cast<int>((int64_t(h) * cap + longest / 2) / longest));
+                auto tensor = apply_transform(sd_image_to_tensor(image), {{"antialias", "true"}}, plan,
+                                              "ref[" + std::to_string(i) + "] cap", ops::InterpolateMode::Lanczos);
+                if (tensor.empty())
+                    return false;
+                auto output = tensor_to_sd_image(tensor);
+                if (output.data == nullptr)
+                    return fail("could not allocate reference cap buffer");
+                owned_images_.push_back(output);
+                image = output;
+            }
+        }
         params.image_preprocess = {};
+        return true;
+    }
+
+    bool ImagePreprocessor::prepare_qwen_references(sd_img_gen_params_t& params) {
+        if (params.ref_max_side == 0 || params.ref_images_count == 0)
+            return true;
+        const int cap = params.ref_max_side / 16 * 16;
+        if (cap < 16)
+            return fail("ref_max_side must be at least 16 for Qwen reference images");
+        if (!prepared_ || params.ref_images != ref_images_.data())
+            return fail("Qwen references must be prepared before alignment");
+        for (int i = 0; i < params.ref_images_count; ++i) {
+            auto& image = ref_images_[i];
+            const int w = static_cast<int>(image.width);
+            const int h = static_cast<int>(image.height);
+            if (std::max(w, h) > cap)
+                return fail("Qwen references must be capped before alignment");
+            const unsigned padded_width = (image.width + 15) / 16 * 16;
+            const unsigned padded_height = (image.height + 15) / 16 * 16;
+            if (padded_width == image.width && padded_height == image.height)
+                continue;
+            const size_t channels = image.channel;
+            const size_t row_bytes = size_t(image.width) * channels;
+            const size_t padded_row_bytes = size_t(padded_width) * channels;
+            auto* pixels = static_cast<uint8_t*>(std::malloc(padded_row_bytes * padded_height));
+            if (pixels == nullptr)
+                return fail("could not allocate Qwen reference padding buffer");
+            for (unsigned y = 0; y < image.height; ++y) {
+                auto* row = pixels + y * padded_row_bytes;
+                std::memcpy(row, image.data + y * row_bytes, row_bytes);
+                for (unsigned x = image.width; x < padded_width; ++x)
+                    std::memcpy(row + x * channels, row + (image.width - 1) * channels, channels);
+            }
+            for (unsigned y = image.height; y < padded_height; ++y)
+                std::memcpy(pixels + y * padded_row_bytes, pixels + (image.height - 1) * padded_row_bytes, padded_row_bytes);
+            sd_image_t output = {padded_width, padded_height, image.channel, pixels};
+            owned_images_.push_back(output);
+            image = output;
+        }
         return true;
     }
 

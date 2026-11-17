@@ -560,6 +560,7 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              "qwen_image_layers: %d\n"
              "ref_images_count: %d\n"
              "ref_image_args: %s\n"
+             "ref_max_side: %d\n"
              "control_strength: %.2f\n"
              "photo maker: {style_strength = %.2f, id_images_count = %d, id_embed_path = %s}\n"
              "VAE tiling: %s (temporal=%s, extra_tiling_args=%s)\n"
@@ -578,6 +579,7 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              sd_img_gen_params->qwen_image_layers,
              sd_img_gen_params->ref_images_count,
              SAFE_STR(sd_img_gen_params->ref_image_args),
+             sd_img_gen_params->ref_max_side,
              sd_img_gen_params->control_strength,
              sd_img_gen_params->pm_params.style_strength,
              sd_img_gen_params->pm_params.id_images_count,

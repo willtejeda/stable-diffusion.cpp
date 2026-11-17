@@ -318,6 +318,11 @@ static bool build_sdapi_img_gen_request(const json& j,
     const bool recipe_dimensions                      = !img2img && model_status(runtime)["recipe"].is_string();
     request.gen_params.width                          = j.value("width", recipe_dimensions ? runtime.default_gen_params->width : -1);
     request.gen_params.height                         = j.value("height", recipe_dimensions ? runtime.default_gen_params->height : -1);
+    if (j.contains("ref_max_side") &&
+        !request.gen_params.from_json_str(json{{"ref_max_side", j["ref_max_side"]}}.dump())) {
+        error_message = "ref_max_side must be an integer from 0 to 8192";
+        return false;
+    }
 
     if (!img2img && j.value("enable_hr", false)) {
         request.gen_params.hires_enabled = true;

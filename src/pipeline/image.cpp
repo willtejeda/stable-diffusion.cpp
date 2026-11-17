@@ -862,7 +862,9 @@ namespace sd::pipeline {
         const auto info = sd::generation_info(request, *sd_img_gen_params);
         sd::ImagePreprocessor preprocessing(sd_img_gen_params->image_preprocess.rules);
         sd_img_gen_params_t processed_params = *sd_img_gen_params;
-        if (!preprocessing.prepare_inputs(processed_params, request.width, request.height))
+        if (!preprocessing.prepare_inputs(processed_params, request.width, request.height, sd_version_is_qwen_image(sd->version)))
+            return false;
+        if (sd_version_is_qwen_image(sd->version) && !preprocessing.prepare_qwen_references(processed_params))
             return false;
         sd_img_gen_params = &processed_params;
         request.pm_params = processed_params.pm_params;
@@ -875,7 +877,8 @@ namespace sd::pipeline {
             return false;
         sd->apply_circular_axes(sd_img_gen_params->circular_x, sd_img_gen_params->circular_y);
 
-        const RefImageParams ref_image_params = sd->resolve_ref_image_params(sd_img_gen_params->ref_image_args);
+        RefImageParams ref_image_params = sd->resolve_ref_image_params(sd_img_gen_params->ref_image_args);
+        ref_image_params.resize_before_vae = sd::ref_resize_before_vae(ref_image_params.resize_before_vae, *sd_img_gen_params);
 
         ImageVaeAxesGuard axes_guard(sd, sd_img_gen_params, request);
 

@@ -13,6 +13,9 @@ namespace sd {
 
     std::pair<int, int> select_image_size_bucket(int source_width, int source_height, int area, int factor, int fallback_width, int fallback_height);
     Tensor<float> resize_and_center_crop(const Tensor<float>& image, int width, int height, ops::InterpolateMode filter = ops::InterpolateMode::Lanczos);
+    inline bool ref_resize_before_vae(bool configured, const sd_img_gen_params_t& params) {
+        return configured && !(params.ref_max_side > 0 && params.ref_images_count > 0);
+    }
 
     enum class ImageTarget {
         Init,
@@ -78,7 +81,8 @@ namespace sd {
         ~ImagePreprocessor();
         ImagePreprocessor(const ImagePreprocessor&)            = delete;
         ImagePreprocessor& operator=(const ImagePreprocessor&) = delete;
-        bool prepare_inputs(sd_img_gen_params_t& params, int width, int height);
+        bool prepare_inputs(sd_img_gen_params_t& params, int width, int height, bool qwen = false);
+        bool prepare_qwen_references(sd_img_gen_params_t& params);
         bool prepare_inputs(sd_vid_gen_params_t& params, int width, int height);
         bool is_valid() const { return valid_; }
         bool validate_inputs(const sd_img_gen_params_t& params) const;

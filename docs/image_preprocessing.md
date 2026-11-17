@@ -134,6 +134,35 @@ To disable reference resizing before VAE encoding, use
 still apply; MiniMax-H3 requires 32-pixel-aligned references and warns instead
 of honoring the switch.
 
+## Reference size cap
+
+`--ref-max-side N` caps each reference image's longest side at `N` pixels
+after all `image_preprocess` rules. The default is `0` (disabled); valid
+values are integers from 0 through 8192. A nonzero cap uses antialiased
+Lanczos downsampling, preserves aspect ratio without cropping, and never
+enlarges a reference. It does not change the requested output dimensions.
+For example, `--ref-max-side 768` caps a 1200×600 reference at 768×384.
+
+When a nonzero cap and reference images are present, the pipeline disables
+`resize_before_vae` even if `ref_image_args` requests it, including for
+references already within the cap. A zero cap retains the existing behavior.
+Model-specific mandatory processing still applies: MiniMax-H3 requires
+32-pixel-aligned references and does not honor that VAE resize switch.
+Visual encoders may independently resize their inputs internally.
+For Qwen references with a nonzero cap, the effective limit is rounded down
+to a multiple of 16 (and must be at least 16). References are then padded on
+the right and bottom with edge pixels to multiples of 16, without cropping or
+enlarging the image content. This also applies to references already below the
+cap. With no references, the minimum does not apply.
+
+
+Native and SDAPI image requests accept `"ref_max_side": 768` directly.
+OpenAI-compatible requests use
+`<sd_cpp_extra_args>{"ref_max_side":768}</sd_cpp_extra_args>` in the prompt.
+For SDAPI, extra arguments override the direct field. The C API equivalent is
+`sd_img_gen_params_t.ref_max_side`, initialized to zero by
+`sd_img_gen_params_init`. Wrapper configurations may select another default.
+
 ## Server requests
 
 Native image/video requests and SDAPI accept `image_preprocess` as a string or

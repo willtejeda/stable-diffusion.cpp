@@ -444,6 +444,7 @@ typedef struct {
     bool circular_x;
     bool circular_y;
     sd_image_preprocess_params_t image_preprocess;
+    int ref_max_side; /* 0 disables the reference image cap; otherwise 1..8192 */
 } sd_img_gen_params_t;
 
 typedef struct {

@@ -1745,6 +1745,21 @@ ArgOptions SDGenerationParams::get_options() {
         return 1;
     };
 
+    auto on_ref_max_side_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) return -1;
+        std::string value(argv[index]);
+        if (value.empty() || !std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; }))
+            return -1;
+        try {
+            int parsed = std::stoi(value);
+            if (parsed > 8192) return -1;
+            ref_max_side = parsed;
+        } catch (...) {
+            return -1;
+        }
+        return 1;
+    };
+
     std::string sample_methods = sample_method_to_str[0];
     for (int i = 1; i < SAMPLE_METHOD_COUNT; i++) {
         sample_methods += ", " + std::string(sample_method_to_str[i]);
@@ -1756,6 +1771,7 @@ ArgOptions SDGenerationParams::get_options() {
     }
 
     options.manual_options = {
+        {"", "--ref-max-side", "Cap reference image long sides (0 disables, maximum 8192)", on_ref_max_side_arg},
         {"-s",
          "--seed",
          "RNG seed (default: 42, use random seed for < 0)",
@@ -2195,6 +2211,17 @@ bool SDGenerationParams::from_json_str(
 
     if (j.contains("image_preprocess") && !parse_image_preprocess_json(j["image_preprocess"].dump()))
         return false;
+    if (j.contains("ref_max_side")) {
+        const auto& value = j["ref_max_side"];
+        if (!value.is_number_integer() ||
+            (value.is_number_unsigned() ? value.get<uint64_t>() > 8192 :
+             (value.get<int64_t>() < 0 || value.get<int64_t>() > 8192))) {
+            LOG_ERROR("ref_max_side must be an integer from 0 to 8192");
+            return false;
+        }
+        ref_max_side = value.get<int>();
+    }
+
 
     auto load_if_exists = [&](const char* key, auto& out) {
         if (j.contains(key)) {
@@ -2865,6 +2892,7 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.ref_images          = ref_image_views.empty() ? nullptr : ref_image_views.data();
     params.ref_images_count    = static_cast<int>(ref_image_views.size());
     params.ref_image_args      = ref_image_args.c_str();
+    params.ref_max_side        = ref_max_side;
     params.mask_image          = mask_image.get();
     params.width               = get_resolved_width();
     params.height              = get_resolved_height();

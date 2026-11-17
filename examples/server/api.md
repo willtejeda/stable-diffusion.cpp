@@ -577,6 +577,7 @@ Currently supported request fields:
 | `scheduler` | `string` | Scheduler name |
 | `lora` | `array<object>` | Structured LoRA list |
 | `extra_images` | `array<string>` | Base64 or data URL images |
+| `ref_max_side` | `integer` | Reference long-side cap, 0..8192; `0` disables, omitted uses the server default |
 | `enable_hr` | `boolean` | Enable highres fix for `txt2img` |
 | `hr_upscaler` | `string` | `Lanczos`, `Nearest`, a latent mode such as `Latent (nearest-exact)`, or an upscaler model name from `/sdapi/v1/upscalers` |
 | `hr_scale` | `number` | Highres scale when resize target is not set |
@@ -934,6 +935,7 @@ LTX and Wan preserve causal state between temporal tiles. Hunyuan Video and TAEH
 | --- | --- |
 | `batch_count` | `integer` |
 | `ref_image_args` | `string` |
+| `ref_max_side` | `integer` |
 | `increase_ref_index` | `boolean` |
 | `control_strength` | `number` |
 | `ip_adapter_strength` | `number` |
@@ -1202,6 +1204,13 @@ Image generation also accepts `ref_image_args` as a string (for example,
 `sd_cpp_extra_args` in OpenAI-compatible requests. It controls downstream
 reference encoding and is independent of input geometry rules.
 
+`ref_max_side` is an integer from 0 through 8192; `0` disables the cap, and omission
+uses the server's CLI default (normally `0`). A positive value downsizes reference
+images after input geometry and prevents subsequent VAE reference enlargement;
+output dimensions are unchanged. Qwen aligns capped references to multiples of
+16. Model-specific alignment still applies; see
+[Image preprocessing](../../docs/image_preprocessing.md) for the full contract.
+
 Any image field accepts:
 
 - a raw base64 string, or
@@ -1238,6 +1247,7 @@ Top-level scalar fields:
 | `seed` | `integer` |
 | `batch_count` | `integer` |
 | `ref_image_args` | `string` |
+| `ref_max_side` | `integer` |
 | `image_preprocess` | `string \| array<string>` |
 | `increase_ref_index` | `boolean` |
 | `control_strength` | `number` |

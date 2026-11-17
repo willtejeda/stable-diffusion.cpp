@@ -125,6 +125,8 @@ namespace sd {
 
     static json image_info(const sd_img_gen_params_t& p) {
         auto info = common_info(p, "image");
+        // Include zero so replay can override a server's nonzero reference cap.
+        info["ref_max_side"] = p.ref_max_side;
         if (p.init_image.data)
             info["strength"] = p.strength;
         if (p.control_image.data)
