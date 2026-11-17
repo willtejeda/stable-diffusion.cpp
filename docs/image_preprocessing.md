@@ -150,8 +150,9 @@ Model-specific mandatory processing still applies: MiniMax-H3 requires
 32-pixel-aligned references and does not honor that VAE resize switch.
 Visual encoders may independently resize their inputs internally.
 For Qwen references with a nonzero cap, the effective limit is rounded down
-to a multiple of 16 (and must be at least 16). References are then padded on
-the right and bottom with edge pixels to multiples of 16, without cropping or
+to the model's reference alignment: 16 for Qwen Image/Edit, 32 for Qwen Image 2.1
+(and must be at least that value). References are then padded on the right and
+bottom with edge pixels to that alignment, without cropping or
 enlarging the image content. This also applies to references already below the
 cap. With no references, the minimum does not apply.
 

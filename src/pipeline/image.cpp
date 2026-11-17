@@ -862,9 +862,8 @@ namespace sd::pipeline {
         const auto info = sd::generation_info(request, *sd_img_gen_params);
         sd::ImagePreprocessor preprocessing(sd_img_gen_params->image_preprocess.rules);
         sd_img_gen_params_t processed_params = *sd_img_gen_params;
-        if (!preprocessing.prepare_inputs(processed_params, request.width, request.height, sd_version_is_qwen_image(sd->version)))
-            return false;
-        if (sd_version_is_qwen_image(sd->version) && !preprocessing.prepare_qwen_references(processed_params))
+        const int reference_multiple = sd->version == VERSION_QWEN_IMAGE_2_1 ? 32 : sd_version_is_qwen_image(sd->version) ? 16 : 1;
+        if (!preprocessing.prepare_inputs(processed_params, request.width, request.height, reference_multiple))
             return false;
         sd_img_gen_params = &processed_params;
         request.pm_params = processed_params.pm_params;

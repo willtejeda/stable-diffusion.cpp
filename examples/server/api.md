@@ -1207,8 +1207,8 @@ reference encoding and is independent of input geometry rules.
 `ref_max_side` is an integer from 0 through 8192; `0` disables the cap, and omission
 uses the server's CLI default (normally `0`). A positive value downsizes reference
 images after input geometry and prevents subsequent VAE reference enlargement;
-output dimensions are unchanged. Qwen aligns capped references to multiples of
-16. Model-specific alignment still applies; see
+output dimensions are unchanged. Capped Qwen Image/Edit references use 16-pixel
+alignment; Qwen Image 2.1 uses 32. Model-specific alignment still applies; see
 [Image preprocessing](../../docs/image_preprocessing.md) for the full contract.
 
 Any image field accepts:

@@ -122,8 +122,7 @@ int main() {
         qwen.width = 1152;
         qwen.height = 640;
         sd::ImagePreprocessor qwen_prep;
-        assert(qwen_prep.prepare_inputs(qwen, qwen.width, qwen.height, true));
-        assert(qwen_prep.prepare_qwen_references(qwen));
+        assert(qwen_prep.prepare_inputs(qwen, qwen.width, qwen.height, 16));
         assert(qwen.width == 1152 && qwen.height == 640);
         assert(qwen.ref_images[0].width == 768 && qwen.ref_images[0].height == 400);
         assert(qwen.ref_images[1].width == 304 && qwen.ref_images[1].height == 208);
@@ -143,21 +142,20 @@ int main() {
         qwen.ref_images_count = 1;
         qwen.ref_max_side = 767;
         sd::ImagePreprocessor qwen_prep;
-        assert(qwen_prep.prepare_inputs(qwen, 512, 512, true));
-        assert(qwen_prep.prepare_qwen_references(qwen));
+        assert(qwen_prep.prepare_inputs(qwen, 512, 512, 16));
         assert(qwen.ref_images[0].width == 752 && qwen.ref_images[0].height == 384);
         assert(ref.width == 768 && ref.height == 385);
     }
-    {
+    for (int alignment : {16, 32}) {
         auto source = image(30, 20, 3);
         sd_image_t ref = source.get();
         sd_img_gen_params_t qwen;
         sd_img_gen_params_init(&qwen);
         qwen.ref_images = &ref;
         qwen.ref_images_count = 1;
-        qwen.ref_max_side = 1;
+        qwen.ref_max_side = alignment - 1;
         sd::ImagePreprocessor qwen_prep;
-        assert(!qwen_prep.prepare_inputs(qwen, 512, 512, true));
+        assert(!qwen_prep.prepare_inputs(qwen, 512, 512, alignment));
     }
     {
         auto source = image(300, 201, 3);
@@ -167,9 +165,25 @@ int main() {
         qwen.ref_images = &ref;
         qwen.ref_images_count = 1;
         sd::ImagePreprocessor qwen_prep;
-        assert(qwen_prep.prepare_inputs(qwen, 512, 512, true));
-        assert(qwen_prep.prepare_qwen_references(qwen));
+        assert(qwen_prep.prepare_inputs(qwen, 512, 512, 16));
         assert(qwen.ref_images[0].width == 300 && qwen.ref_images[0].height == 201);
+    }
+    // Qwen2.1's VLM rejects references not divisible by 32, even though legacy Qwen accepts 16.
+    for (int cap : {768, 767}) {
+        auto source = image(768, 385, 4);
+        sd_image_t ref = source.get();
+        sd_img_gen_params_t qwen;
+        sd_img_gen_params_init(&qwen);
+        qwen.ref_images = &ref;
+        qwen.ref_images_count = 1;
+        qwen.ref_max_side = cap;
+        sd::ImagePreprocessor qwen_prep;
+        assert(qwen_prep.prepare_inputs(qwen, 512, 512, 32));
+        assert(qwen.ref_images[0].width == (cap == 768 ? 768 : 736));
+        assert(qwen.ref_images[0].height == (cap == 768 ? 416 : 384));
+        assert(qwen.ref_images[0].width <= unsigned(cap) && qwen.ref_images[0].height <= unsigned(cap));
+        assert(qwen.ref_images[0].width % 32 == 0 && qwen.ref_images[0].height % 32 == 0);
+        assert(ref.width == 768 && ref.height == 385);
     }
     SDGenerationParams empty;
     empty.ref_max_side = 768;

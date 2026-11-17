@@ -81,8 +81,7 @@ namespace sd {
         ~ImagePreprocessor();
         ImagePreprocessor(const ImagePreprocessor&)            = delete;
         ImagePreprocessor& operator=(const ImagePreprocessor&) = delete;
-        bool prepare_inputs(sd_img_gen_params_t& params, int width, int height, bool qwen = false);
-        bool prepare_qwen_references(sd_img_gen_params_t& params);
+        bool prepare_inputs(sd_img_gen_params_t& params, int width, int height, int reference_multiple = 1);
         bool prepare_inputs(sd_vid_gen_params_t& params, int width, int height);
         bool is_valid() const { return valid_; }
         bool validate_inputs(const sd_img_gen_params_t& params) const;

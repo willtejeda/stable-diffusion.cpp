@@ -454,7 +454,7 @@ namespace sd {
         return true;
     }
 
-    bool ImagePreprocessor::prepare_inputs(sd_img_gen_params_t& params, int width, int height, bool qwen) {
+    bool ImagePreprocessor::prepare_inputs(sd_img_gen_params_t& params, int width, int height, int reference_multiple) {
         if (prepared_)
             return fail("inputs have already been prepared");
         prepared_ = true;
@@ -462,9 +462,11 @@ namespace sd {
             return false;
         if (params.ref_max_side < 0 || params.ref_max_side > 8192)
             return fail("ref_max_side must be between 0 and 8192");
-        if (qwen && params.ref_images_count > 0 && params.ref_max_side > 0 && params.ref_max_side < 16)
-            return fail("ref_max_side must be at least 16 for Qwen reference images");
-        const int cap = qwen && params.ref_max_side > 0 ? params.ref_max_side / 16 * 16 : params.ref_max_side;
+        if (reference_multiple < 1)
+            return fail("reference alignment must be positive");
+        if (params.ref_images_count > 0 && params.ref_max_side > 0 && params.ref_max_side < reference_multiple)
+            return fail("ref_max_side must be at least " + std::to_string(reference_multiple) + " for this model");
+        const int cap = params.ref_max_side / reference_multiple * reference_multiple;
         if (!prepare_image(params.init_image, ImageTarget::Init, 0, width, height) ||
             !prepare_image(params.mask_image, ImageTarget::Mask, 0, width, height) ||
             !prepare_image(params.control_image, ImageTarget::Control, 0, width, height) ||
@@ -497,25 +499,12 @@ namespace sd {
             }
         }
         params.image_preprocess = {};
-        return true;
-    }
-
-    bool ImagePreprocessor::prepare_qwen_references(sd_img_gen_params_t& params) {
-        if (params.ref_max_side == 0 || params.ref_images_count == 0)
+        if (cap == 0 || reference_multiple == 1)
             return true;
-        const int cap = params.ref_max_side / 16 * 16;
-        if (cap < 16)
-            return fail("ref_max_side must be at least 16 for Qwen reference images");
-        if (!prepared_ || params.ref_images != ref_images_.data())
-            return fail("Qwen references must be prepared before alignment");
         for (int i = 0; i < params.ref_images_count; ++i) {
             auto& image = ref_images_[i];
-            const int w = static_cast<int>(image.width);
-            const int h = static_cast<int>(image.height);
-            if (std::max(w, h) > cap)
-                return fail("Qwen references must be capped before alignment");
-            const unsigned padded_width = (image.width + 15) / 16 * 16;
-            const unsigned padded_height = (image.height + 15) / 16 * 16;
+            const unsigned padded_width = (image.width + reference_multiple - 1) / reference_multiple * reference_multiple;
+            const unsigned padded_height = (image.height + reference_multiple - 1) / reference_multiple * reference_multiple;
             if (padded_width == image.width && padded_height == image.height)
                 continue;
             const size_t channels = image.channel;
@@ -523,7 +512,7 @@ namespace sd {
             const size_t padded_row_bytes = size_t(padded_width) * channels;
             auto* pixels = static_cast<uint8_t*>(std::malloc(padded_row_bytes * padded_height));
             if (pixels == nullptr)
-                return fail("could not allocate Qwen reference padding buffer");
+                return fail("could not allocate reference padding buffer");
             for (unsigned y = 0; y < image.height; ++y) {
                 auto* row = pixels + y * padded_row_bytes;
                 std::memcpy(row, image.data + y * row_bytes, row_bytes);
