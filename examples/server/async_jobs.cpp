@@ -213,14 +213,16 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
 
     if (job.status == AsyncJobStatus::Completed) {
         if (job.kind == AsyncJobKind::VidGen) {
-            result["result"] = {
-                {"output_format", job.vid_gen.output_format},
-                {"mime_type", job.result_media_mime_type},
-                {"fps", job.result_fps},
-                {"frame_count", job.result_frame_count},
-                {"b64_json", job.result_media_b64},
-                {"generation_info", job.result_generation_info},
-            };
+            result["result"] = {{"generation_info", job.result_generation_info}};
+            if (!job.result_generation_info.value("video_latent_exported", false)) {
+                result["result"].update({
+                    {"output_format", job.vid_gen.output_format},
+                    {"mime_type", job.result_media_mime_type},
+                    {"fps", job.result_fps},
+                    {"frame_count", job.result_frame_count},
+                    {"b64_json", job.result_media_b64},
+                });
+            }
         } else {
             json images = json::array();
             for (size_t i = 0; i < job.result_images_b64.size(); ++i) {
@@ -362,15 +364,25 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             output_fps       = generated->fps;
             generated_audio  = generated->audio;
             generated->audio = nullptr;
+            if (generated->frame_count == 0) {
+                output_info = json::parse(generated->generation_info);
+            }
             results.adopt_video(generated, runtime.ctx_params->lora_model_dir);
-            output_info = json::parse(results.generation_info(0));
-            if (job.vid_gen.gen_params.embed_image_metadata)
-                str_params = results.generation_info(0);
+            if (results.count() > 0) {
+                output_info = json::parse(results.generation_info(0));
+                if (job.vid_gen.gen_params.embed_image_metadata) {
+                    str_params = results.generation_info(0);
+                }
+            }
         }
         clear_preview_callback();
     }
 
     num_results = results.count();
+    if (!job.cancel_requested.load() && output_info.is_object() && output_info.value("video_latent_exported", false)) {
+        free_sd_audio(generated_audio);
+        return true;
+    }
     if (job.cancel_requested.load() || num_results <= 0) {
         free_sd_audio(generated_audio);
         error_message = "generate_video returned no results";

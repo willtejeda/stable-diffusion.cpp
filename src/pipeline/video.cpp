@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <optional>
 #include <utility>
 
 #include "conditioning/wan_audio.h"
 #include "core/rng.hpp"
 #include "core/rng_philox.hpp"
+#include "core/tensor_ggml.hpp"
 #include "diffusion_engine.h"
 #include "model/diffusion/minimax_h3.hpp"
 #include "model/upscaler/ltx_latent_upscaler.hpp"
@@ -1261,6 +1263,24 @@ namespace sd::pipeline {
         return embeds;
     }
 
+    // Files are chosen by the operator at process start, never by a server request.
+    static bool export_video_latent(const char* path, const sd::Tensor<float>& latent) {
+        std::ofstream output(path, std::ios::binary);
+        const int32_t header[] = {5, 0, GGML_TYPE_F32};
+        output.write(reinterpret_cast<const char*>(header), sizeof(header));
+        for (int64_t n : latent.shape()) {
+            const auto dim = static_cast<int32_t>(n);
+            output.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
+        }
+        output.write(reinterpret_cast<const char*>(latent.data()), latent.numel() * sizeof(float));
+        output.close();
+        if (!output) {
+            LOG_ERROR("could not export video latent");
+            return false;
+        }
+        return true;
+    }
+
     static sd_image_t* decode_video_outputs(StableDiffusionGGML* sd,
                                             const GenerationRequest& request,
                                             const sd::Tensor<float>& final_latent,
@@ -1283,7 +1303,11 @@ namespace sd::pipeline {
                     (int)video_latent.shape()[1],
                     (int)video_latent.shape()[2],
                     (int)video_latent.shape()[3]);
-        // auto z = sd::load_tensor_from_file_as_tensor<float>("ltx_vae_z.bin");
+        if (const char* path = std::getenv("SD_VIDEO_LATENT_EXPORT_FILE")) {
+            if (!export_video_latent(path, video_latent)) {
+                return nullptr;
+            }
+        }
         int64_t t4            = ggml_time_ms();
         sd::Tensor<float> vid = sd->decode_first_stage(video_latent, true);
         int64_t t5            = ggml_time_ms();
@@ -1626,6 +1650,18 @@ namespace sd::pipeline {
         sd_vid_gen_params = &processed_params;
         if (fps_out != nullptr) {
             *fps_out = request.fps;
+        }
+        if (const char* path = std::getenv("SD_VIDEO_LATENT_REPLAY_FILE")) {
+            auto latent = sd::load_tensor_from_file_as_tensor<float>(path);
+            if (latent.dim() != 5 || latent.shape()[3] != sd->get_latent_channel() || frames_out == nullptr) {
+                LOG_ERROR("unexpected replay video latent shape");
+                return false;
+            }
+            *frames_out = decode_video_outputs(sd, request, latent, num_frames_out);
+            if (*frames_out && info_out) {
+                *info_out = info;
+            }
+            return *frames_out != nullptr;
         }
         bool latent_upscale_enabled     = request.hires.enabled;
         GenerationRequest hires_request = request;
@@ -1994,6 +2030,17 @@ namespace sd::pipeline {
             LOG_ERROR("cancelling generation before video decode");
             free_sd_audio(generated_audio);
             return false;
+        }
+        if (const char* path = std::getenv("SD_WAN_LATENT_ONLY_FILE")) {
+            if (sd->version != VERSION_WAN2_2_TI2V || info_out == nullptr || !export_video_latent(path, final_latent)) {
+                LOG_ERROR("external video decode is only available for Wan 2.2 TI2V");
+                free_sd_audio(generated_audio);
+                return false;
+            }
+            *info_out = info;
+            (*info_out)["video_latent_exported"] = true;
+            free_sd_audio(generated_audio);
+            return true;
         }
         auto result = decode_video_outputs(sd, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
         LOG_DEBUG("decode_video_outputs returned %s", result == nullptr ? "nullptr (failed)" : "frames");
