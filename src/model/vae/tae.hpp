@@ -484,6 +484,10 @@ public:
     }
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* z) override {
+        return forward(ctx, z, nullptr);
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* z, const VAETemporalTile* tile) {
         auto first_conv = std::dynamic_pointer_cast<Conv2d>(blocks["1"]);
 
         // Clamp()
@@ -498,8 +502,31 @@ public:
         int index = 3;
         for (int i = 0; i < num_layers; i++) {
             for (int j = 0; j < num_blocks; j++) {
-                auto mem = ggml_ext_pad_ext(ctx->ggml_ctx, ctx->backend, h, 0, 0, 0, 0, 0, 0, 1, 0);
-                mem      = ggml_view_4d(ctx->ggml_ctx, mem, h->ne[0], h->ne[1], h->ne[2], h->ne[3], h->nb[1], h->nb[2], h->nb[3], 0);
+                auto* gc = ctx->ggml_ctx;
+                ggml_tensor* mem = nullptr;
+                if (tile != nullptr) {
+                    const auto key = "taehv_mem:" + std::to_string(index);
+                    if (!tile->first) {
+                        auto* past = ctx->load_cache_tensor(key);
+                        GGML_ASSERT(past != nullptr);
+                        mem = past;
+                        if (h->ne[3] > 1) {
+                            auto* prefix = ggml_view_4d(gc, h, h->ne[0], h->ne[1], h->ne[2],
+                                                        h->ne[3] - 1, h->nb[1], h->nb[2], h->nb[3], 0);
+                            mem = ggml_concat(gc, past, prefix, 3);
+                        }
+                    }
+                    if (!tile->last) {
+                        // A MemBlock consumes its previous input, not its previous output.
+                        auto* last = ggml_view_4d(gc, h, h->ne[0], h->ne[1], h->ne[2], 1,
+                                                 h->nb[1], h->nb[2], h->nb[3], (h->ne[3] - 1) * h->nb[3]);
+                        ctx->persist_cache_tensor(key, last);
+                    }
+                }
+                if (mem == nullptr) {
+                    mem = ggml_ext_pad_ext(gc, ctx->backend, h, 0, 0, 0, 0, 0, 0, 1, 0);
+                    mem = ggml_view_4d(gc, mem, h->ne[0], h->ne[1], h->ne[2], h->ne[3], h->nb[1], h->nb[2], h->nb[3], 0);
+                }
                 if (is_wide) {
                     auto block = std::dynamic_pointer_cast<WideMemBlock>(blocks[std::to_string(index++)]);
                     h          = block->forward(ctx, h, mem);
@@ -523,8 +550,12 @@ public:
         if (patch_size > 1) {
             h = unpatchify(ctx->ggml_ctx, h, patch_size, 1);
         }
-        // shape(W, H, 3, (t_upscale - 1) + T) => shape(W, H, 3, T)
-        h = ggml_view_4d(ctx->ggml_ctx, h, h->ne[0], h->ne[1], h->ne[2], h->ne[3] - (t_upscale - 1), h->nb[1], h->nb[2], h->nb[3], (t_upscale - 1) * h->nb[3]);
+        // The causal startup prefix only occurs at the start of the sequence.
+        if (tile == nullptr || tile->first) {
+            const int trim = t_upscale - 1;
+            h = ggml_view_4d(ctx->ggml_ctx, h, h->ne[0], h->ne[1], h->ne[2], h->ne[3] - trim,
+                             h->nb[1], h->nb[2], h->nb[3], trim * h->nb[3]);
+        }
         return h;
     }
 };
@@ -566,13 +597,13 @@ public:
         }
     }
 
-    ggml_tensor* decode(GGMLRunnerContext* ctx, ggml_tensor* z) {
+    ggml_tensor* decode(GGMLRunnerContext* ctx, ggml_tensor* z, const VAETemporalTile* tile = nullptr) {
         auto decoder = std::dynamic_pointer_cast<TinyVideoDecoder>(blocks["decoder"]);
         if (sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version) || sd_version_is_minimax_h3(version)) {
             // (W, H, C, T) -> (W, H, T, C)
             z = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, z, 0, 1, 3, 2));
         }
-        auto result = decoder->forward(ctx, z);
+        auto result = decoder->forward(ctx, z, tile);
 
         if (sd_version_is_minimax_h3(version)) {
             int64_t num_frames   = result->ne[3];
@@ -884,14 +915,62 @@ struct TinyVideoAutoEncoder : public VAE {
         return taehv.z_channels;
     }
 
-    ggml_cgraph* build_graph(const sd::Tensor<float>& z_tensor, bool decode_graph) {
-        ggml_cgraph* gf  = decode_graph && is_wide ? ggml_new_graph_custom(compute_ctx, 4096, false)
+    ggml_cgraph* build_graph(const sd::Tensor<float>& z_tensor, bool decode_graph,
+                             const VAETemporalTile* tile = nullptr) {
+        ggml_cgraph* gf  = decode_graph && (is_wide || tile != nullptr)
+                              ? ggml_new_graph_custom(compute_ctx, 4096, false)
                                                    : ggml_new_graph(compute_ctx);
         ggml_tensor* z   = make_input(z_tensor);
-        auto runner_ctx  = get_context();
-        ggml_tensor* out = decode_graph ? taehv.decode(&runner_ctx, z) : taehv.encode(&runner_ctx, z);
+        auto runner_ctx  = get_context(tile != nullptr ? gf : nullptr);
+        ggml_tensor* out = decode_graph ? taehv.decode(&runner_ctx, z, tile) : taehv.encode(&runner_ctx, z);
         ggml_build_forward_expand(gf, out);
         return gf;
+    }
+
+    sd::Tensor<float> _compute_temporal_tiled(const int n_threads,
+                                             const sd::Tensor<float>& input,
+                                             VAETemporalDirection direction,
+                                             const VAETemporalTilingConfig& config) override {
+        if (version != VERSION_WAN2_2_TI2V || direction != VAETemporalDirection::DECODE) {
+            return VAE::_compute_temporal_tiled(n_threads, input, direction, config);
+        }
+        auto stateful = config;
+        stateful.overlap = 0;
+        const auto plan = make_vae_temporal_tile_plan(input.shape()[2], stateful);
+        if (plan.tiles.size() == 1) {
+            return _compute(n_threads, input, true);
+        }
+        LOG_VERBOSE("taehv stateful temporal tiling: tile_frames=%d, total_frames=%lld, tiles=%zu",
+                    plan.tile_frames, (long long)input.shape()[2], plan.tiles.size());
+        const int scale = get_temporal_tile_output_scale(direction);
+        const int64_t output_frames = (input.shape()[2] - 1) * scale + 1;
+        free_cache_ctx_and_buffer();
+        sd::Tensor<float> output;
+        for (const auto& tile : plan.tiles) {
+            const auto latent = sd::ops::slice(input, 2, tile.start, tile.end);
+            auto get_graph = [&]() { return build_graph(latent, true, &tile); };
+            auto decoded = restore_trailing_singleton_dims(
+                GGMLRunner::compute(get_graph, n_threads, false), input.dim());
+            if (decoded.empty()) {
+                free_cache_ctx_and_buffer();
+                return {};
+            }
+            if (output.empty()) {
+                auto shape = decoded.shape();
+                shape[2] = output_frames;
+                output.resize(std::move(shape));
+            }
+            const int64_t frames = decoded.shape()[2];
+            const int64_t frame_start = tile.first ? 0 : (tile.start - 1) * scale + 1;
+            const int64_t inner = decoded.shape()[0] * decoded.shape()[1];
+            const int64_t tile_plane = inner * frames;
+            for (int64_t i = 0; i < decoded.numel() / tile_plane; ++i) {
+                std::copy_n(decoded.data() + i * tile_plane, tile_plane,
+                            output.data() + (i * output_frames + frame_start) * inner);
+            }
+        }
+        free_cache_ctx_and_buffer();
+        return output;
     }
 
     sd::Tensor<float> _compute(const int n_threads,
