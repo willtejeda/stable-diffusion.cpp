@@ -1,6 +1,9 @@
 #ifndef __SD_MODEL_VAE_TAE_HPP__
 #define __SD_MODEL_VAE_TAE_HPP__
 
+#include <array>
+#include <stdexcept>
+
 #include "core/ggml_extend.h"
 #include "core/ggml_runner.h"
 #include "core/rng.hpp"
@@ -321,7 +324,7 @@ public:
     }
 };
 
-ggml_tensor*
+inline ggml_tensor*
 patchify(ggml_context* ctx,
          ggml_tensor* x,
          int64_t patch_size,
@@ -351,7 +354,7 @@ patchify(ggml_context* ctx,
     return x;
 }
 
-ggml_tensor* unpatchify(ggml_context* ctx,
+inline ggml_tensor* unpatchify(ggml_context* ctx,
                         ggml_tensor* x,
                         int64_t patch_size,
                         int64_t b = 1) {
@@ -438,25 +441,24 @@ public:
     }
 };
 
+using VideoTAEWidths = std::array<int, 4>;
+inline constexpr VideoTAEWidths stock_video_tae_widths = {256, 128, 64, 64};
+
 class TinyVideoDecoder : public UnaryBlock {
     int z_channels               = 4;
     int out_channels             = 3;
     int num_blocks               = 3;
     static const int num_layers  = 3;
-    int channels[num_layers + 1] = {256, 128, 64, 64};
+    VideoTAEWidths channels;
     int patch_size               = 1;
     bool is_wide                 = false;
 
 public:
     int t_upscale = 1;
-    TinyVideoDecoder(int z_channels = 4, int patch_size = 1, std::vector<bool> time_upscale = {false, true, true}, bool is_wide = false)
-        : z_channels(z_channels), patch_size(patch_size), is_wide(is_wide) {
-        t_upscale = 1;
-        if (is_wide) {
-            channels[0] = 1024;
-            channels[1] = 512;
-            channels[2] = 256;
-        }
+    TinyVideoDecoder(int z_channels, int patch_size, const std::vector<bool>& time_upscale,
+                     bool is_wide, VideoTAEWidths widths)
+        : z_channels(z_channels), channels(is_wide ? VideoTAEWidths{1024, 512, 256, 64} : widths),
+          patch_size(patch_size), is_wide(is_wide) {
 
         for (bool upscale : time_upscale) {
             if (upscale) {
@@ -572,7 +574,8 @@ public:
     std::vector<bool> time_upscale   = {false, true, true};
 
 public:
-    TAEHV(bool decode_only = true, SDVersion version = VERSION_WAN2, bool is_wide = false)
+    TAEHV(bool decode_only = true, SDVersion version = VERSION_WAN2, bool is_wide = false,
+          VideoTAEWidths widths = stock_video_tae_widths)
         : decode_only(decode_only), version(version), is_wide(is_wide) {
         int patch = 1;
         if (version == VERSION_WAN2_2_TI2V) {
@@ -591,7 +594,7 @@ public:
             patch          = 2;
             time_downscale = {true, true, false};
         }
-        blocks["decoder"] = std::shared_ptr<GGMLBlock>(new TinyVideoDecoder(z_channels, patch, time_upscale, is_wide));
+        blocks["decoder"] = std::shared_ptr<GGMLBlock>(new TinyVideoDecoder(z_channels, patch, time_upscale, is_wide, widths));
         if (!decode_only) {
             blocks["encoder"] = std::shared_ptr<GGMLBlock>(new TinyVideoEncoder(z_channels, patch, time_downscale));
         }
@@ -605,7 +608,7 @@ public:
         }
         auto result = decoder->forward(ctx, z, tile);
 
-        if (sd_version_is_minimax_h3(version)) {
+        if (sd_version_is_minimax_h3(version) && tile == nullptr) {
             int64_t num_frames   = result->ne[3];
             int64_t chunk_frames = 5 * decoder->t_upscale;
             int64_t pad          = (chunk_frames - (num_frames % chunk_frames)) % chunk_frames;
@@ -864,13 +867,24 @@ struct TinyVideoAutoEncoder : public VAE {
                          std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
         : VAE(version, backend, "tae", weight_manager),
           decode_only(decoder_only) {
-        for (auto tensor_storage : tensor_storage_map) {
-            if (tensor_storage.first.find(prefix + ".3.conv.6.weight") != std::string::npos) {
-                is_wide = true;
-                break;
+        const auto key = [&](int layer) {
+            return "tae." + prefix + "." + std::to_string(layer) + ".weight";
+        };
+        is_wide = tensor_storage_map.count("tae." + prefix + ".3.conv.6.weight") != 0;
+        auto widths = stock_video_tae_widths;
+        if (!is_wide && (sd_version_is_minimax_h3(version) || version == VERSION_WAN2_2_TI2V)) {
+            constexpr std::array<int, 4> layers = {1, 8, 14, 20};
+            for (size_t i = 0; i < layers.size(); ++i) {
+                if (const auto it = tensor_storage_map.find(key(layers[i])); it != tensor_storage_map.end()) {
+                    const auto width = it->second.ne[3];
+                    if (it->second.n_dims != 4 || width <= 0 || width > 1024) {
+                        throw std::runtime_error("invalid dense TAEHV layer shape: " + it->first);
+                    }
+                    widths[i] = static_cast<int>(width);
+                }
             }
         }
-        taehv       = TAEHV(decoder_only, version, is_wide);
+        taehv = TAEHV(decoder_only, version, is_wide, widths);
         scale_input = false;
         taehv.init(params_ctx, tensor_storage_map, prefix);
     }
@@ -880,7 +894,7 @@ struct TinyVideoAutoEncoder : public VAE {
     }
 
     bool supports_temporal_tiling(VAETemporalDirection direction) const override {
-        return direction == VAETemporalDirection::DECODE && !sd_version_is_minimax_h3(version);
+        return direction == VAETemporalDirection::DECODE;
     }
 
     int get_temporal_tile_output_scale(VAETemporalDirection direction) const override {
@@ -931,10 +945,14 @@ struct TinyVideoAutoEncoder : public VAE {
                                              const sd::Tensor<float>& input,
                                              VAETemporalDirection direction,
                                              const VAETemporalTilingConfig& config) override {
-        if (version != VERSION_WAN2_2_TI2V || direction != VAETemporalDirection::DECODE) {
+        const bool h3 = sd_version_is_minimax_h3(version);
+        if ((!h3 && version != VERSION_WAN2_2_TI2V) || direction != VAETemporalDirection::DECODE) {
             return VAE::_compute_temporal_tiled(n_threads, input, direction, config);
         }
         auto stateful = config;
+        if (h3 && input.shape()[2] % 5 != 2) {
+            return _compute(n_threads, input, true);
+        }
         stateful.overlap = 0;
         const auto plan = make_vae_temporal_tile_plan(input.shape()[2], stateful);
         if (plan.tiles.size() == 1) {
@@ -943,7 +961,10 @@ struct TinyVideoAutoEncoder : public VAE {
         LOG_VERBOSE("taehv stateful temporal tiling: tile_frames=%d, total_frames=%lld, tiles=%zu",
                     plan.tile_frames, (long long)input.shape()[2], plan.tiles.size());
         const int scale = get_temporal_tile_output_scale(direction);
-        const int64_t output_frames = (input.shape()[2] - 1) * scale + 1;
+        const int64_t raw_frames = (input.shape()[2] - 1) * scale + 1;
+        // H3 keeps 17 frames of each 20-frame period after causal startup,
+        // then trims the padded tail. The phase is global, not per tile.
+        const int64_t output_frames = h3 ? (input.shape()[2] / 5) * 17 + 5 : raw_frames;
         free_cache_ctx_and_buffer();
         sd::Tensor<float> output;
         for (const auto& tile : plan.tiles) {
@@ -964,9 +985,23 @@ struct TinyVideoAutoEncoder : public VAE {
             const int64_t frame_start = tile.first ? 0 : (tile.start - 1) * scale + 1;
             const int64_t inner = decoded.shape()[0] * decoded.shape()[1];
             const int64_t tile_plane = inner * frames;
-            for (int64_t i = 0; i < decoded.numel() / tile_plane; ++i) {
-                std::copy_n(decoded.data() + i * tile_plane, tile_plane,
-                            output.data() + (i * output_frames + frame_start) * inner);
+            for (int64_t start = 0; start < frames;) {
+                const int64_t raw_index = frame_start + start;
+                const int64_t phase = h3 ? raw_index % 20 : 0;
+                if (phase >= 17) {
+                    start += 20 - phase;
+                    continue;
+                }
+                const int64_t dest = h3 ? raw_index / 20 * 17 + phase : raw_index;
+                if (dest >= output_frames) {
+                    break;
+                }
+                const int64_t count = h3 ? std::min({frames - start, 17 - phase, output_frames - dest}) : frames;
+                for (int64_t i = 0; i < decoded.numel() / tile_plane; ++i) {
+                    std::copy_n(decoded.data() + i * tile_plane + start * inner, count * inner,
+                                output.data() + (i * output_frames + dest) * inner);
+                }
+                start += count;
             }
         }
         free_cache_ctx_and_buffer();
