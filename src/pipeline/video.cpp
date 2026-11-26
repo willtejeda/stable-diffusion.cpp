@@ -1596,6 +1596,10 @@ namespace sd::pipeline {
                         nlohmann::json* info_out) {
         if (info_out)
             *info_out = nlohmann::json();
+        if (sd->version == VERSION_MINIMAX_H3_IMAGE) {
+            LOG_ERROR("MiniMax-H3-Image cannot be run with generate_video(); use generate_image() or --mode img_gen");
+            return false;
+        }
         GenerationRequest request(sd, sd_vid_gen_params);
         const auto info = sd::generation_info(request, *sd_vid_gen_params);
         if (sd->config_->animatediff_loaded && sd_version_supports_animatediff(sd->version)) {

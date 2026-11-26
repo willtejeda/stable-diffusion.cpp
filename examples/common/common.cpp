@@ -24,6 +24,7 @@
 #include "log.h"
 #include "media_io.h"
 #include "resource_owners.hpp"
+#include "runtime/minimax_h3_image_schedule.h"
 
 using json   = nlohmann::json;
 namespace fs = std::filesystem;
@@ -1530,6 +1531,9 @@ ArgOptions SDGenerationParams::get_options() {
         std::string sigmas_str = value;
         if (sigmas_str == "qwen-image-2.1-turbo") {
             sigmas_str = "1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0";
+        } else if (sigmas_str == "minimax-h3-image") {
+            target->insert(target->end(), MiniMaxH3::pdd_sigmas.begin(), MiniMaxH3::pdd_sigmas.end());
+            return 1;
         }
         if (!sigmas_str.empty() && sigmas_str.front() == '[') {
             sigmas_str.erase(0, 1);
@@ -1793,11 +1797,11 @@ ArgOptions SDGenerationParams::get_options() {
          on_scheduler_arg},
         {"",
          "--sigmas",
-         "custom sigma values for the sampler, comma-separated (e.g., \"14.61,7.8,3.5,0.0\") or preset: qwen-image-2.1-turbo.",
+         "custom sigma values for the sampler, comma-separated (e.g., \"14.61,7.8,3.5,0.0\") or preset: qwen-image-2.1-turbo, minimax-h3-image.",
          on_sigmas_arg},
         {"",
          "--hires-sigmas",
-         "custom sigma values for the highres fix second pass, comma-separated (e.g., \"0.85,0.725,0.421875,0.0\") or preset: qwen-image-2.1-turbo.",
+         "custom sigma values for the highres fix second pass, comma-separated (e.g., \"0.85,0.725,0.421875,0.0\") or preset: qwen-image-2.1-turbo, minimax-h3-image.",
          on_hires_sigmas_arg},
         {"",
          "--skip-layers",
@@ -1809,7 +1813,7 @@ ArgOptions SDGenerationParams::get_options() {
          on_high_noise_skip_layers_arg},
         {"-r",
          "--ref-image",
-         "reference image for Flux Kontext or MiniMax-H3 Ref2VA (can be used multiple times)",
+         "reference image for image editing or MiniMax-H3 Ref2VA (can be used multiple times)",
          on_ref_image_arg},
         {"",
          "--ref-video",

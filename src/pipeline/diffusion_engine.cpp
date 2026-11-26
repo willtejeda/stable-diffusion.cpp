@@ -1501,6 +1501,11 @@ bool StableDiffusionGGML::build_denoiser() {
             break;
         }
         case H3_AV_FLOW_PRED: {
+            if (version == VERSION_MINIMAX_H3_IMAGE) {
+                LOG_INFO("running in MiniMax H3 Image FLOW mode");
+                denoiser = std::make_shared<MiniMaxH3ImageDenoiser>();
+                break;
+            }
             LOG_INFO("running in MiniMax H3 AV FLOW mode");
             denoiser = std::make_shared<H3AVFlowDenoiser>(default_flow_shift, 3.f, get_latent_channel());
             break;
@@ -2600,6 +2605,7 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                 diffusion_params.extra = LLaDAImageDiffusionExtra{
                     condition.extra_c_crossattns.empty() ? nullptr : &condition.extra_c_crossattns[0]};
             } else if (sd_version_is_minimax_h3(version)) {
+                const size_t target_index = static_cast<size_t>(std::abs(step));
                 diffusion_params.extra = MiniMaxH3DiffusionExtra{
                     condition.c_token_types.empty() ? nullptr : &condition.c_token_types,
                     condition.c_position_ids.empty() ? nullptr : &condition.c_position_ids,
@@ -2607,7 +2613,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                     condition.c_reference_blocks.empty() ? nullptr : &condition.c_reference_blocks,
                     audio_length,
                     std::isfinite(active_flow_shift) ? active_flow_shift : 12.f,
-                    3.f};
+                    3.f,
+                    target_index > 0 && target_index < sigmas.size() ? sigmas[target_index] : NAN};
             } else if (sd_version_is_ltxav(version)) {
                 diffusion_params.extra = LTXAVDiffusionExtra{
                     nullptr,
@@ -2959,7 +2966,7 @@ int StableDiffusionGGML::video_frames_to_latent_frames(int frames) {
     int latent_frames = frames;
     if (sd_version_is_ltxav(version)) {
         latent_frames = ((frames - 1) / 8) + 1;
-    } else if (sd_version_is_minimax_h3(version)) {
+    } else if (version == VERSION_MINIMAX_H3) {
         latent_frames = frames <= 5 ? 2 : ((frames - 5) / 17) * 5 + 2;
     } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version)) {
         latent_frames = ((frames - 1) / 4) + 1;
@@ -2974,7 +2981,7 @@ int StableDiffusionGGML::latent_frames_to_video_frames(int latent_frames) {
     if (sd_version_is_ltxav(version)) {
         return (latent_frames - 1) * 8 + 1;
     }
-    if (sd_version_is_minimax_h3(version)) {
+    if (version == VERSION_MINIMAX_H3) {
         return latent_frames <= 2 ? 5 : ((latent_frames - 2) / 5) * 17 + 5;
     }
     if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version)) {
@@ -2984,7 +2991,7 @@ int StableDiffusionGGML::latent_frames_to_video_frames(int latent_frames) {
 }
 
 int StableDiffusionGGML::align_video_frames(int frames) {
-    if (sd_version_is_minimax_h3(version)) {
+    if (version == VERSION_MINIMAX_H3) {
         frames = std::max(frames, 5);
         while (frames % 17 != 5) {
             ++frames;
@@ -3032,6 +3039,9 @@ sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float
             return {};
         }
         auto decoded = first_stage_model->decode(n_threads, latents, tiling_params, decode_video, circular_x, circular_y);
+        if (version == VERSION_MINIMAX_H3_IMAGE && !decoded.empty() && decoded.dim() == 5) {
+            decoded.squeeze_(2);
+        }
         if (!decoded.empty() ||
             !sd::backend_fit::prepare_vae_decode_retry_tiling(tiling_params, prefer_temporal_tiling,
                                                               first_stage_model->last_compute_status(),
@@ -3207,7 +3217,7 @@ RefImageParams StableDiffusionGGML::resolve_ref_image_params(const char* ref_ima
                 rejected_keys.insert(key);
                 valid = false;
             }
-            if (valid && !sd_version_is_minimax_h3(version)) {
+            if (valid && version != VERSION_MINIMAX_H3) {
                 LOG_WARN("ref_image_size is only supported by MiniMax-H3 for now");
             }
         } else if (key != "preset" && key != "vlm_size") {
@@ -3231,7 +3241,7 @@ RefImageParams StableDiffusionGGML::resolve_ref_image_params(const char* ref_ima
     if (params.force_ref_timestep_zero && !sd_version_is_krea2(version)) {
         LOG_WARN("force_ref_timestep_zero is only supported by Krea2 architecture for now");
     }
-    if (sd_version_is_minimax_h3(version)) {
+    if (version == VERSION_MINIMAX_H3) {
         // H3 consumes references as VAE latents in its own packed sequence rather than
         // through the generic conditioner/DiT reference path, so ref_image_size is the
         // only arg it acts on. Everything else is reported as ineffective rather than

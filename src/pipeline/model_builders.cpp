@@ -110,7 +110,7 @@ namespace sd::model_builders {
         return false;
     }
 
-    bool build_vae_runners(const Context& ctx, const VAEOptions& options, VAERunners& runners) {
+    bool build_vae_runners(const Context& ctx, const VAEOptions& options, VAERunners& runners) try {
         const auto* sd_ctx_params      = &ctx.params;
         const auto& tensor_storage_map = ctx.tensor_storage_map;
         const auto version             = ctx.version;
@@ -159,6 +159,14 @@ namespace sd::model_builders {
                                                      version,
                                                      weight_manager);
             } else if (find_model_traits(vae_version)->vae_kind == ModelVAEKind::MINIMAX_H3) {
+                if (version == VERSION_MINIMAX_H3_IMAGE) {
+                    const auto proj = tensor_storage_map.find("first_stage_model.decoder.proj_out.weight");
+                    const auto embedder = tensor_storage_map.find("first_stage_model.decoder.x_embedder.weight");
+                    if (proj == tensor_storage_map.end() || embedder == tensor_storage_map.end() ||
+                        proj->second.ne[1] != 3 * 16 * 16 || embedder->second.ne[1] != 1024) {
+                        throw std::runtime_error("MiniMax-H3-Image requires its dedicated image VAE, not the video VAE");
+                    }
+                }
                 return std::make_shared<MiniMaxH3VAE::MiniMaxH3VideoVAERunner>(ctx.backends.runtime_backend(SDBackendModule::VAE),
                                                                                tensor_storage_map,
                                                                                "first_stage_model",
@@ -204,6 +212,9 @@ namespace sd::model_builders {
                                                    ctx.backends.runtime_backend(SDBackendModule::VAE),
                                                    weight_manager);
         } else if (options.use_tae && !options.tae_preview_only) {
+            if (version == VERSION_MINIMAX_H3_IMAGE) {
+                throw std::runtime_error("MiniMax-H3-Image requires its dedicated image VAE; TAE is preview-only");
+            }
             LOG_INFO("using TAE for encoding / decoding");
             result.vae = create_tae(false);
         } else {
@@ -240,6 +251,10 @@ namespace sd::model_builders {
         }
         runners = std::move(result);
         return true;
+    }
+    catch (const std::exception& error) {
+        LOG_ERROR("failed to build VAE runners: %s", error.what());
+        return false;
     }
 
     bool build_control_net_runner(const Context& ctx, std::shared_ptr<ControlNet>& runner) {

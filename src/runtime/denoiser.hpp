@@ -19,6 +19,7 @@
 #include "model.h"
 #include "runtime/gits_noise.h"
 #include "runtime/guidance.h"
+#include "runtime/minimax_h3_image_schedule.h"
 
 /*================================================= CompVisDenoiser ==================================================*/
 
@@ -1401,6 +1402,33 @@ struct MingImageFlowDenoiser : DiscreteFlowDenoiser {
         }
         // Upstream sets sigma_min to zero before linspace, then appends the terminal zero.
         sigmas.push_back(0.f);
+        return sigmas;
+    }
+};
+
+struct MiniMaxH3ImageDenoiser : public DiscreteFlowDenoiser {
+    MiniMaxH3ImageDenoiser() : DiscreteFlowDenoiser(1.f) {}
+
+    float sigma_max() override { return 1.f; }
+
+    std::vector<float> get_sigmas(uint32_t n, int image_seq_len, scheduler_t scheduler, SDVersion version, const char* extra_sample_args = nullptr) override {
+        if (scheduler != DISCRETE_SCHEDULER) {
+            return DiscreteFlowDenoiser::get_sigmas(n, image_seq_len, scheduler, version, extra_sample_args);
+        }
+        if (n == 0) {
+            return {};
+        }
+        const auto& grid = MiniMaxH3::pdd_sigmas;
+        const size_t intervals = grid.size() - 1;
+        std::vector<float> sigmas;
+        sigmas.reserve(size_t(n) + 1);
+        for (uint32_t i = 0; i < n; ++i) {
+            const size_t step = size_t(i) * intervals;
+            const size_t index = step / n;
+            const float fraction = static_cast<float>(step % n) / n;
+            sigmas.push_back(grid[index] + fraction * (grid[index + 1] - grid[index]));
+        }
+        sigmas.push_back(grid.back());
         return sigmas;
     }
 };

@@ -1,0 +1,89 @@
+diff --git a/src/ggml-backend-meta.cpp b/src/ggml-backend-meta.cpp
+index d2d4cbc8..ec67b622 100644
+--- a/src/ggml-backend-meta.cpp
++++ b/src/ggml-backend-meta.cpp
+@@ -2041,6 +2041,9 @@ struct ggml_backend_meta_context {
+     // all-gather (sequence parallelism): one event per device, recorded when the device has finished the sub-graph
+     // before the gather, so that no device writes into another's memory while that device may still use it
+     std::vector<ggml_backend_event_t> gather_events;
++    bool gather_has_events = false;
++    size_t gather_host_size = 0;
++    std::unique_ptr<char[]> gather_host;
+ 
+     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
+@@ -2698,30 +2701,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     };
+ 
+ 
+-    // Sequence parallelism (ggml_backend_meta_all_gather): every device's slice of the input copied into every device's
+-    // whole copy, at its offset (slices are contiguous blocks along the outermost axis). Device-to-device copies go
+-    // through the backend's async copy (CUDA: cudaMemcpyPeerAsync on the source stream; the destination stream waits).
++    // Sequence parallelism: reassemble the complete tensor on every device.
+     auto all_gather = [&](ggml_tensor * node) -> ggml_status {
+         ggml_tensor * src = node->src[0];
+-        if (backend_ctx->gather_events.size() != n_backends) {
+-            backend_ctx->gather_events.assign(n_backends, nullptr);
+-        }
+-        for (size_t k = 0; k < n_backends; k++) {
+-            auto & bck = backend_ctx->backend_configs[k];
+-            if (backend_ctx->gather_events[k] == nullptr) {
+-                backend_ctx->gather_events[k] = ggml_backend_event_new(ggml_backend_get_device(bck.backend));
+-                GGML_ASSERT(backend_ctx->gather_events[k] != nullptr);
++        if (backend_ctx->gather_events.empty()) {
++            backend_ctx->gather_events.resize(n_backends);
++            backend_ctx->gather_has_events = true;
++            for (size_t k = 0; k < n_backends; k++) {
++                auto event = ggml_backend_event_new(ggml_backend_get_device(backend_ctx->backend_configs[k].backend));
++                backend_ctx->gather_events[k] = event;
++                if (event == nullptr) {
++                    backend_ctx->gather_has_events = false;
++                    break;
++                }
+             }
+-            ggml_backend_event_record(backend_ctx->gather_events[k], bck.backend);
+         }
+-        // No device writes into another before that one has finished the sub-graph: the gathered tensor's memory may
+-        // have held tensors the other device was still reading.
+-        for (size_t j = 0; j < n_backends; j++) {
++        // The destination may reuse memory its subgraph was still reading.
++        if (backend_ctx->gather_has_events) {
+             for (size_t k = 0; k < n_backends; k++) {
+-                if (k != j) {
+-                    ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, backend_ctx->gather_events[k]);
++                ggml_backend_event_record(backend_ctx->gather_events[k], backend_ctx->backend_configs[k].backend);
++            }
++            for (size_t j = 0; j < n_backends; j++) {
++                for (size_t k = 0; k < n_backends; k++) {
++                    if (k != j) {
++                        ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, backend_ctx->gather_events[k]);
++                    }
+                 }
+             }
++        } else {
++            for (auto & bc : backend_ctx->backend_configs) {
++                ggml_backend_synchronize(bc.backend);
++            }
++            size_t offset = 0;
++            for (size_t j = 0; j < n_backends; j++) {
++                auto * src_j = ggml_backend_meta_buffer_simple_tensor(src, j);
++                const size_t nbytes = ggml_nbytes(src_j);
++                if (nbytes == 0) {
++                    continue;
++                }
++                if (nbytes > backend_ctx->gather_host_size) {
++                    backend_ctx->gather_host.reset(new char[nbytes]);
++                    backend_ctx->gather_host_size = nbytes;
++                }
++                ggml_backend_tensor_get(src_j, backend_ctx->gather_host.get(), 0, nbytes);
++                for (size_t k = 0; k < n_backends; k++) {
++                    auto * dst = ggml_backend_meta_buffer_simple_tensor(node, k);
++                    ggml_backend_tensor_set(dst, backend_ctx->gather_host.get(), offset, nbytes);
++                }
++                offset += nbytes;
++            }
++            GGML_ASSERT(offset == ggml_nbytes(node));
++            return GGML_STATUS_SUCCESS;
+         }
+         for (size_t k = 0; k < n_backends; k++) {
+             auto & bck = backend_ctx->backend_configs[k];

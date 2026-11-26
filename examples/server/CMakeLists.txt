@@ -101,7 +101,7 @@ foreach(RECIPE_FILE IN LISTS BUILTIN_RECIPE_FILES)
     string(APPEND SD_BUILTIN_RECIPES "R\"recipes(${RECIPE_JSON})recipes\",\n")
 endforeach()
 configure_file(recipes_builtin.h.in "${CMAKE_CURRENT_BINARY_DIR}/recipes_builtin.h" @ONLY)
-target_include_directories(${TARGET} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(${TARGET} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/src")
 
 install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE stable-diffusion ${CMAKE_THREAD_LIBS_INIT})

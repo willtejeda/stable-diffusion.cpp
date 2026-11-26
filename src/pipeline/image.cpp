@@ -144,12 +144,32 @@ namespace sd::pipeline {
         return padded;
     }
 
+    static std::optional<sd::Tensor<float>> resize_h3_image_reference(const sd::Tensor<float>& image,
+                                                                     int64_t max_short_edge) {
+        const int64_t short_edge = std::min(image.shape()[0], image.shape()[1]);
+        const double scale = static_cast<double>(std::clamp<int64_t>(short_edge, 1024, max_short_edge)) / short_edge;
+        auto aligned = [scale](int64_t size) {
+            return std::max<int64_t>(32, static_cast<int64_t>(std::nearbyint(size * scale / 32)) * 32);
+        };
+        const int64_t width  = aligned(image.shape()[0]);
+        const int64_t height = aligned(image.shape()[1]);
+        if (width == image.shape()[0] && height == image.shape()[1]) {
+            return std::nullopt;
+        }
+        return sd::ops::interpolate(image, {width, height, image.shape()[2], image.shape()[3]}, sd::ops::InterpolateMode::Lanczos);
+    }
+
     static std::optional<ImageGenerationLatents> prepare_image_generation_latents(StableDiffusionGGML* sd,
                                                                                   const sd_img_gen_params_t* sd_img_gen_params,
                                                                                   GenerationRequest* request,
                                                                                   SamplePlan* plan,
                                                                                   const RefImageParams& ref_image_params) {
         int64_t prepare_start_ms = ggml_time_ms();
+        const bool h3_image = sd->version == VERSION_MINIMAX_H3_IMAGE;
+        if (h3_image && sd_img_gen_params->ref_images_count > 16) {
+            LOG_ERROR("MiniMax-H3-Image supports at most 16 reference images");
+            return std::nullopt;
+        }
 
         sd::Tensor<float> init_image_tensor;
         sd::Tensor<float> control_image_tensor;
@@ -300,6 +320,10 @@ namespace sd::pipeline {
         for (int i = 0; i < sd_img_gen_params->ref_images_count; i++) {
             ref_images.push_back(ensure_image_tensor_channels(sd_image_to_tensor(sd_img_gen_params->ref_images[i]),
                                                               image_channels));
+            if (h3_image && ref_images.back().empty()) {
+                LOG_ERROR("invalid MiniMax-H3-Image reference image %d", i + 1);
+                return std::nullopt;
+            }
         }
 
         if (ref_images.empty() && sd_version_is_unet_edit(sd->version)) {
@@ -323,7 +347,19 @@ namespace sd::pipeline {
                 continue;
             }
             sd::Tensor<float> ref_latent;
-            if (ref_image_params.resize_before_vae && !sd_version_is_pid(sd->version)) {
+            if (h3_image) {
+                auto resized = resize_h3_image_reference(ref_images[i], 2048);
+                ref_latent = sd->encode_first_stage(resized ? *resized : ref_images[i]);
+                if (!ref_latent.empty()) {
+                    const auto& shape = ref_latent.shape();
+                    auto rng = std::make_shared<MT19937RNG>(static_cast<uint64_t>(request->seed));
+                    // The condition noise follows patch token order, not image-pixel order.
+                    auto noise = sd::randn<float>({2, 2, shape[3], shape[0] / 2, shape[1] / 2}, rng)
+                                     .permute({0, 3, 1, 4, 2})
+                                     .reshape(shape);
+                    ref_latent = ref_latent * 0.999f + noise * (1.f - 0.999f);
+                }
+            } else if (ref_image_params.resize_before_vae && !sd_version_is_pid(sd->version)) {
                 LOG_VERBOSE("auto resize ref images");
                 double vae_width;
                 double vae_height;
@@ -450,6 +486,26 @@ namespace sd::pipeline {
         }
 
         ImageGenerationLatents latents;
+        if (h3_image) {
+            if (init_latent.dim() == 4) {
+                init_latent.unsqueeze_(2);
+            }
+            latent_mask.unsqueeze_(2);
+            if (ref_image_params.pass_to_dit) {
+                for (size_t i = 0; i < ref_latents.size(); ++i) {
+                    latents.minimax_reference_blocks.push_back({MiniMaxH3ReferenceKind::IMAGE, static_cast<int32_t>(i), -1});
+                }
+            } else {
+                ref_latents.clear();
+            }
+            if (ref_image_params.pass_to_vlm) {
+                for (auto& image : ref_images) {
+                    if (auto resized = resize_h3_image_reference(image, 1024)) {
+                        image = std::move(*resized);
+                    }
+                }
+            }
+        }
         latents.init_latent              = std::move(init_latent);
         latents.concat_latent            = std::move(concat_latent);
         latents.img_uncond_concat_latent = std::move(img_uncond_concat_latent);
@@ -502,6 +558,7 @@ namespace sd::pipeline {
         if (cond.c_concat.empty() && ref_image_params.pass_to_dit) {
             cond.c_concat = latents->concat_latent;  // TODO: optimize
         }
+        cond.c_reference_blocks = latents->minimax_reference_blocks;
 
         bool use_ref_latent_img_cfg = request->use_img_uncond &&
                                       !latents->ref_images.empty() &&
@@ -546,6 +603,7 @@ namespace sd::pipeline {
             if (uncond.c_concat.empty() && ref_image_params.pass_to_dit) {
                 uncond.c_concat = latents->concat_latent;  // TODO: optimize
             }
+            uncond.c_reference_blocks = latents->minimax_reference_blocks;
         }
 
         SDCondition img_uncond;
@@ -882,6 +940,10 @@ namespace sd::pipeline {
         ImageVaeAxesGuard axes_guard(sd, sd_img_gen_params, request);
 
         SamplePlan plan(sd, sd_img_gen_params, request);
+        if (sd->version == VERSION_MINIMAX_H3_IMAGE && plan.sample_method != EULER_SAMPLE_METHOD) {
+            LOG_ERROR("MiniMax-H3-Image PDD requires the Euler sampler");
+            return false;
+        }
         auto latents_opt = prepare_image_generation_latents(sd,
                                                             sd_img_gen_params,
                                                             &request,
